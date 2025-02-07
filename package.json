@@ -1,0 +1,17 @@
+{
+  "name": "discord-reminder-bot",
+  "version": "1.0.0",
+  "description": "A Discord bot that sets natural language reminders and stores data in a Discord channel.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.0.0",
+    "node-schedule": "^2.1.0",
+    "chrono-node": "^2.3.0",
+    "dotenv": "^16.0.0"
+  },
+  "author": "Your Name",
+  "license": "MIT"
+}
