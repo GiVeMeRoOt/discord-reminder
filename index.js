@@ -17,7 +17,7 @@ require('dotenv').config();
 // Global map to store scheduled jobs (key: reminder id, value: job object)
 const scheduledJobs = new Map();
 
-// The ID of the channel where reminder data is stored (set in .env)
+// The ID of the channel where reminder data is stored (from .env)
 const STORAGE_CHANNEL_ID = process.env.REMINDER_STORAGE_CHANNEL_ID;
 
 // Create a new Discord client instance with guild intents
@@ -29,10 +29,10 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const commands = [
   new SlashCommandBuilder()
     .setName('rme')
-    .setDescription('Set a reminder (e.g. "/rme at 22:45")')
+    .setDescription('Set a reminder (e.g. "/rme at 22:45" or "/rme tomorrow at 10am")')
     .addStringOption(option =>
       option.setName('time')
-            .setDescription('When to be reminded (e.g. "at 22:45" or "tomorrow at 3pm")')
+            .setDescription('When to be reminded (e.g. "at 22:45", "tomorrow at 10am", "feb 18th", "in10 days")')
             .setRequired(true))
     .addStringOption(option =>
       option.setName('title')
@@ -62,7 +62,7 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 })();
 
 // --- Helper: Schedule a Reminder ---
-// The reminder object includes: id, userId, channelId, remindAt (ISO string), and optional title.
+// Reminder object: { id, userId, channelId, remindAt (ISO string), title (optional) }
 function scheduleReminder(reminder) {
   try {
     const remindAt = new Date(reminder.remindAt);
@@ -75,10 +75,8 @@ function scheduleReminder(reminder) {
           console.error(`Channel ${reminder.channelId} not found for reminder ${reminder.id}`);
           return;
         }
-        // Prepare reminder text, including title if provided.
         let reminderText = reminder.title ? `Reminder: **${reminder.title}**` : "Reminder: It's time!";
         
-        // Create snooze buttons.
         const row = new ActionRowBuilder()
           .addComponents(
             new ButtonBuilder()
@@ -95,13 +93,12 @@ function scheduleReminder(reminder) {
               .setStyle(ButtonStyle.Primary)
           );
         
-        // Send the reminder message with snooze buttons.
         await channel.send({
           content: `<@${reminder.userId}> ${reminderText}`,
           components: [row]
         });
 
-        // Instead of deleting, update the stored reminder to mark it as triggered.
+        // Update storage message to mark as triggered.
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (storageChannel && storageChannel.isTextBased()) {
           const messages = await storageChannel.messages.fetch({ limit: 100 });
@@ -119,7 +116,6 @@ function scheduleReminder(reminder) {
             await storageMessage.edit(JSON.stringify(currentData));
           }
         }
-        // Remove job from the map.
         scheduledJobs.delete(reminder.id);
       } catch (err) {
         console.error(`Error sending reminder ${reminder.id}:`, err);
@@ -148,7 +144,6 @@ client.once('ready', async () => {
         if (remindAt > new Date()) {
           scheduleReminder(data);
         } else {
-          // Optionally delete outdated reminders.
           message.delete().catch(console.error);
         }
       } catch (err) {
@@ -163,31 +158,46 @@ client.once('ready', async () => {
 // --- Handle Slash Commands and Button Interactions ---
 client.on('interactionCreate', async interaction => {
   if (interaction.isCommand()) {
-    // Handle /rme command
     if (interaction.commandName === 'rme') {
       try {
-        const timeInput = interaction.options.getString('time');
+        let timeInputRaw = interaction.options.getString('time');
         const title = interaction.options.getString('title'); // optional title
 
-        // Use a base reference in IST
-        const baseDateIST = DateTime.now().setZone('Asia/Kolkata').toJSDate();
-        let parsedDate = chrono.parseDate(timeInput, baseDateIST);
-        if (!parsedDate) {
+        // Pre-process input: insert a space if needed (e.g., "in10 days" → "in 10 days")
+        const timeInput = timeInputRaw.replace(/in(\d+)/i, "in $1");
+
+        // Create a base reference in IST.
+        const baseIST = DateTime.now().setZone('Asia/Kolkata');
+        // Parse the input relative to the base IST date.
+        let parsedJSDate = chrono.parseDate(timeInput, baseIST.toJSDate());
+        if (!parsedJSDate) {
           await interaction.reply({ content: 'Sorry, I could not understand that time. Please try a different format.', ephemeral: true });
           return;
         }
-        // Rebuild the date in IST explicitly using the parsed time.
-        const dtIST = DateTime.fromObject({
-          year: baseDateIST.getFullYear(),
-          month: baseDateIST.getMonth() + 1,
-          day: baseDateIST.getDate(),
-          hour: parsedDate.getHours(),
-          minute: parsedDate.getMinutes(),
-          second: parsedDate.getSeconds()
-        }, { zone: 'Asia/Kolkata' });
-        parsedDate = dtIST.toJSDate();
-          
-        if (parsedDate <= new Date()) {
+        // Convert the parsed date to a Luxon DateTime (initially in the server’s zone)
+        let dt = DateTime.fromJSDate(parsedJSDate);
+        // Force interpretation as IST by keeping the local time
+        dt = dt.setZone('Asia/Kolkata', { keepLocalTime: true });
+        
+        // If no explicit time-of-day is mentioned (e.g., "feb 18th" or "in 10 days"), use the current IST time-of-day.
+        const timeMentioned = /(\d{1,2}(:\d{2})?\s*(am|pm))/i.test(timeInput);
+        if (!timeMentioned) {
+          dt = dt.set({
+            hour: baseIST.hour,
+            minute: baseIST.minute,
+            second: baseIST.second,
+            millisecond: baseIST.millisecond
+          });
+        }
+        
+        // At this point, dt should represent the intended reminder time in IST.
+        // If the resulting time is still before now (in IST), adjust by adding one day.
+        if (dt <= baseIST) {
+          dt = dt.plus({ days: 1 });
+        }
+        
+        const finalISTDate = dt.toJSDate();
+        if (finalISTDate <= new Date()) {
           await interaction.reply({ content: 'The time specified is in the past. Please enter a future time.', ephemeral: true });
           return;
         }
@@ -198,22 +208,25 @@ client.on('interactionCreate', async interaction => {
           id: reminderId,
           userId: interaction.user.id,
           channelId: interaction.channelId,
-          remindAt: parsedDate.toISOString(),
+          // Store the reminder time as the ISO string with the IST offset.
+          remindAt: dt.toISO(),
           title: title || null
         };
 
-        // Save the reminder in the storage channel as a JSON string.
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (!storageChannel || !storageChannel.isTextBased()) {
           await interaction.reply({ content: 'Storage channel not available. Cannot set reminder.', ephemeral: true });
           return;
         }
         await storageChannel.send(JSON.stringify(reminderData));
-
-        // Schedule the reminder.
         scheduleReminder(reminderData);
-
-        await interaction.reply(`Alright, <@${interaction.user.id}>, I will remind you <t:${Math.floor(parsedDate.getTime()/1000)}:R>. (Reminder ID: \`${reminderId}\`)`);
+        
+        // Acknowledge the reminder. If a title is provided, include it in the acknowledgement.
+        let ackMsg = `Alright, <@${interaction.user.id}>, I will remind you <t:${Math.floor(finalISTDate.getTime()/1000)}:R>. (Reminder ID: \`${reminderId}\`)`;
+        if (title) {
+          ackMsg = `Alright, <@${interaction.user.id}>, I will remind you about **${title}** <t:${Math.floor(finalISTDate.getTime()/1000)}:R>. (Reminder ID: \`${reminderId}\`)`;
+        }
+        await interaction.reply(ackMsg);
       } catch (err) {
         console.error('Error handling /rme command:', err);
         try {
@@ -223,7 +236,6 @@ client.on('interactionCreate', async interaction => {
         }
       }
     } else if (interaction.commandName === 'delrme') {
-      // Handle /delrme command
       try {
         const reminderId = interaction.options.getString('id').trim();
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
@@ -260,16 +272,13 @@ client.on('interactionCreate', async interaction => {
       }
     }
   } else if (interaction.isButton()) {
-    // Handle button interactions for snoozing
     const customId = interaction.customId;
     if (customId.startsWith('snooze_')) {
-      const parts = customId.split('_'); // e.g. ["snooze", "30", "1234567890"]
+      const parts = customId.split('_'); // e.g. ["snooze", "30", "reminderId"]
       let snoozeTimeMs = 0;
       if (parts[1].endsWith('s')) {
-        // If ends with 's', treat as seconds.
         snoozeTimeMs = parseInt(parts[1].slice(0, -1), 10) * 1000;
       } else {
-        // Otherwise, treat as minutes.
         snoozeTimeMs = parseInt(parts[1], 10) * 60000;
       }
       const reminderId = parts.slice(2).join('_');
@@ -292,16 +301,11 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', ephemeral: true });
           return;
         }
-        // Schedule a new reminder for the snooze duration.
         const newDate = new Date(Date.now() + snoozeTimeMs);
         const updatedReminder = JSON.parse(storageMessage.content);
-        updatedReminder.remindAt = newDate.toISOString();
-        
-        // Update the storage message with the new time.
+        updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata', { keepLocalTime: true }).toISO();
         await storageMessage.edit(JSON.stringify(updatedReminder));
-        // Reschedule the reminder.
         scheduleReminder(updatedReminder);
-        
         await interaction.update({ content: `<@${interaction.user.id}> Reminder snoozed for ${snoozeTimeMs/60000} minutes.`, components: [] });
       } catch (err) {
         console.error('Error handling snooze button:', err);
