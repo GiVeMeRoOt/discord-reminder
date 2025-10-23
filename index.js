@@ -37,7 +37,19 @@ const commands = [
     .addStringOption(option =>
       option.setName('title')
             .setDescription('Optional title for the reminder')
-            .setRequired(false)),
+            .setRequired(false))
+    .addStringOption(option =>
+      option.setName('repeat')
+            .setDescription('Repeat interval for the reminder')
+            .setRequired(false)
+            .addChoices(
+              { name: 'Every hour', value: 'hourly' },
+              { name: 'Every day', value: 'daily' },
+              { name: 'Weekdays (Mon-Fri)', value: 'weekday' },
+              { name: 'Every week', value: 'weekly' },
+              { name: 'Every month', value: 'monthly' },
+              { name: 'Every year', value: 'yearly' }
+            )),
   new SlashCommandBuilder()
     .setName('delrme')
     .setDescription('Delete a reminder by its ID')
@@ -258,14 +270,96 @@ function parseReminderDateTime(timeInputRaw, baseIST) {
   return dt;
 }
 
+/**
+ * Describe a recurrence pattern in a user friendly manner for acknowledgement
+ * messages and logs.
+ *
+ * @param {string} recurrenceType - The recurrence identifier.
+ * @returns {string} Human readable description.
+ */
+function describeRecurrence(recurrenceType) {
+  switch (recurrenceType) {
+    case 'hourly':
+      return 'every hour';
+    case 'daily':
+      return 'every day';
+    case 'weekday':
+      return 'every weekday';
+    case 'weekly':
+      return 'every week';
+    case 'monthly':
+      return 'every month';
+    case 'yearly':
+      return 'every year';
+    default:
+      return 'on a repeating schedule';
+  }
+}
+
+/**
+ * Compute the next DateTime (in IST) for a given recurrence pattern.
+ *
+ * @param {DateTime} currentIST - The current scheduled DateTime in IST.
+ * @param {string} recurrenceType - Recurrence identifier.
+ * @returns {DateTime|null} The next scheduled time or null when not possible.
+ */
+function getNextRecurrenceDateTime(currentIST, recurrenceType) {
+  if (!currentIST || !currentIST.isValid) {
+    return null;
+  }
+
+  switch (recurrenceType) {
+    case 'hourly':
+      return currentIST.plus({ hours: 1 });
+    case 'daily':
+      return currentIST.plus({ days: 1 });
+    case 'weekday': {
+      let next = currentIST.plus({ days: 1 });
+      let guard = 0;
+      while (next.weekday > 5) {
+        next = next.plus({ days: 1 });
+        guard += 1;
+        if (guard > 7) {
+          return null;
+        }
+      }
+      return next;
+    }
+    case 'weekly':
+      return currentIST.plus({ weeks: 1 });
+    case 'monthly':
+      return currentIST.plus({ months: 1 });
+    case 'yearly':
+      return currentIST.plus({ years: 1 });
+    default:
+      return null;
+  }
+}
+
 // --- Helper: Schedule a Reminder ---
 // Reminder object: { id, userId, channelId, remindAt (ISO string), title (optional) }
 function scheduleReminder(reminder) {
   try {
+    if (!reminder || !reminder.remindAt) {
+      return;
+    }
     const remindAt = new Date(reminder.remindAt);
+    if (Number.isNaN(remindAt.getTime())) {
+      console.error(`Invalid reminder time for reminder ${reminder.id}`);
+      return;
+    }
     if (remindAt <= new Date()) return; // Do not schedule if time has passed
 
+    if (scheduledJobs.has(reminder.id)) {
+      const existingJob = scheduledJobs.get(reminder.id);
+      if (existingJob && typeof existingJob.cancel === 'function') {
+        existingJob.cancel();
+      }
+      scheduledJobs.delete(reminder.id);
+    }
+
     const job = schedule.scheduleJob(remindAt, async function () {
+      scheduledJobs.delete(reminder.id);
       try {
         const channel = await client.channels.fetch(reminder.channelId);
         if (!channel) {
@@ -309,11 +403,35 @@ function scheduleReminder(reminder) {
           });
           if (storageMessage) {
             const currentData = JSON.parse(storageMessage.content);
-            currentData.triggered = true;
-            await storageMessage.edit(JSON.stringify(currentData));
+            const recurrenceType = currentData?.recurrence?.type;
+            if (recurrenceType) {
+              let nextIST = DateTime.fromISO(reminder.remindAt).setZone('Asia/Kolkata');
+              let iterations = 0;
+              const nowIST = DateTime.now().setZone('Asia/Kolkata');
+
+              do {
+                nextIST = getNextRecurrenceDateTime(nextIST, recurrenceType);
+                iterations += 1;
+                if (!nextIST) {
+                  break;
+                }
+              } while (nextIST <= nowIST && iterations < 400);
+
+              if (nextIST && iterations < 400) {
+                currentData.remindAt = nextIST.toISO();
+                currentData.triggered = false;
+                await storageMessage.edit(JSON.stringify(currentData));
+                scheduleReminder(currentData);
+              } else {
+                currentData.triggered = true;
+                await storageMessage.edit(JSON.stringify(currentData));
+              }
+            } else {
+              currentData.triggered = true;
+              await storageMessage.edit(JSON.stringify(currentData));
+            }
           }
         }
-        scheduledJobs.delete(reminder.id);
       } catch (err) {
         console.error(`Error sending reminder ${reminder.id}:`, err);
       }
@@ -340,6 +458,26 @@ client.once('ready', async () => {
         const remindAt = new Date(data.remindAt);
         if (remindAt > new Date()) {
           scheduleReminder(data);
+        } else if (data?.recurrence?.type) {
+          let nextIST = DateTime.fromISO(data.remindAt).setZone('Asia/Kolkata');
+          const nowIST = DateTime.now().setZone('Asia/Kolkata');
+          let iterations = 0;
+
+          do {
+            nextIST = getNextRecurrenceDateTime(nextIST, data.recurrence.type);
+            iterations += 1;
+            if (!nextIST) {
+              break;
+            }
+          } while (nextIST <= nowIST && iterations < 400);
+
+          if (nextIST && iterations < 400) {
+            data.remindAt = nextIST.toISO();
+            message.edit(JSON.stringify(data)).catch(console.error);
+            scheduleReminder(data);
+          } else {
+            message.delete().catch(console.error);
+          }
         } else {
           message.delete().catch(console.error);
         }
@@ -359,6 +497,7 @@ client.on('interactionCreate', async interaction => {
       try {
         const timeInputRaw = interaction.options.getString('time');
         const title = interaction.options.getString('title'); // optional title
+        const repeat = interaction.options.getString('repeat');
 
         // Create a base reference in IST and attempt to parse the natural language input.
         const baseIST = DateTime.now().setZone('Asia/Kolkata');
@@ -387,7 +526,9 @@ client.on('interactionCreate', async interaction => {
           channelId: interaction.channelId,
           // Store the reminder time as the ISO string with the IST offset.
           remindAt: dt.toISO(),
-          title: title || null
+          title: title || null,
+          recurrence: repeat ? { type: repeat } : null,
+          triggered: false
         };
 
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
@@ -397,11 +538,14 @@ client.on('interactionCreate', async interaction => {
         }
         await storageChannel.send(JSON.stringify(reminderData));
         scheduleReminder(reminderData);
-        
+
         // Acknowledge the reminder. If a title is provided, include it in the acknowledgement.
         let ackMsg = `Alright, <@${interaction.user.id}>, I will remind you <t:${Math.floor(finalISTDate.getTime()/1000)}:R>. (Reminder ID: \`${reminderId}\`)`;
         if (title) {
           ackMsg = `Alright, <@${interaction.user.id}>, I will remind you about **${title}** <t:${Math.floor(finalISTDate.getTime()/1000)}:R>. (Reminder ID: \`${reminderId}\`)`;
+        }
+        if (repeat) {
+          ackMsg += ` This reminder will repeat ${describeRecurrence(repeat)}.`;
         }
         await interaction.reply(ackMsg);
       } catch (err) {
