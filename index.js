@@ -84,7 +84,7 @@ function normalizeTimeInput(rawInput) {
 
   // Helpful replacements for common natural phrases which chrono does not
   // always interpret as expected.
-  const replacements = [
+  const guardedReplacements = [
     { regex: /\btonight\b/gi, replacement: 'today at 9pm' },
     { regex: /\bthis\s+evening\b/gi, replacement: 'today at 7pm' },
     { regex: /\bthis\s+afternoon\b/gi, replacement: 'today at 3pm' },
@@ -93,14 +93,104 @@ function normalizeTimeInput(rawInput) {
     { regex: /\btomorrow\s+morning\b/gi, replacement: 'tomorrow at 9am' },
     { regex: /\btomorrow\s+afternoon\b/gi, replacement: 'tomorrow at 3pm' },
     { regex: /\btomorrow\s+evening\b/gi, replacement: 'tomorrow at 7pm' },
-    { regex: /\btomorrow\s+night\b/gi, replacement: 'tomorrow at 9pm' },
-    { regex: /\bnoon\b/gi, replacement: '12pm' },
-    { regex: /\bmidnight\b/gi, replacement: '12am' }
+    { regex: /\btomorrow\s+night\b/gi, replacement: 'tomorrow at 9pm' }
   ];
 
-  replacements.forEach(({ regex, replacement }) => {
-    normalized = normalized.replace(regex, replacement);
+  // Determine whether the substring immediately following a matched natural
+  // language phrase already specifies a concrete time (e.g. "at 8pm" or
+  // "for 20:30"). In those situations we should not inject our default hour,
+  // otherwise we risk overriding the user supplied value.
+  const startsWithExplicitTime = (text) => {
+    const directTimePattern = /^(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?|noon|midnight)\b/i;
+    const atOrSymbolTimePattern = /\b(?:at|@)\s*(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?|noon|midnight)\b/i;
+    const aroundTimePattern = /\b(?:around|about|approximately)\s*(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)?|noon|midnight)\b/i;
+    const forTimePattern = /\bfor\s*(?:\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}\s*(?:am|pm)|\d{1,2}:\d{2}|noon|midnight)\b/i;
+    const meridiemOrColonAnywhere = /\b(?:\d{1,2}:\d{2}|\d{1,2}\s*(?:am|pm)|noon|midnight)\b/i;
+
+    let remaining = text.trimStart();
+    if (!remaining) {
+      return false;
+    }
+
+    while (true) {
+      remaining = remaining.trimStart();
+      if (!remaining) {
+        return false;
+      }
+
+      const punctuationMatch = remaining.match(/^([,.:@\-?!])/);
+      if (punctuationMatch) {
+        remaining = remaining.slice(punctuationMatch[0].length);
+        continue;
+      }
+
+      const connectorMatch = remaining.match(/^(?:and|at|around|about|approximately)\b/i);
+      if (connectorMatch) {
+        remaining = remaining.slice(connectorMatch[0].length);
+        continue;
+      }
+
+      const timeMatch = remaining.match(directTimePattern);
+      if (timeMatch) {
+        const remainder = remaining.slice(timeMatch[0].length);
+        if (/^\s*(?:hours?|hrs?|minutes?|mins?|seconds?|secs?)\b/i.test(remainder)) {
+          remaining = remainder;
+          continue;
+        }
+
+        return true;
+      }
+
+      break;
+    }
+
+    if (atOrSymbolTimePattern.test(text)) {
+      return true;
+    }
+
+    if (aroundTimePattern.test(text)) {
+      return true;
+    }
+
+    if (forTimePattern.test(text)) {
+      return true;
+    }
+
+    return meridiemOrColonAnywhere.test(text);
+  };
+
+  const applyGuardedReplacement = (input, { regex, replacement }) => {
+    const flags = regex.flags || '';
+    const globalRegex = new RegExp(regex.source, flags.includes('g') ? flags : `${flags}g`);
+    let result = '';
+    let lastIndex = 0;
+    let match;
+
+    while ((match = globalRegex.exec(input)) !== null) {
+      const matchStart = match.index;
+      const matchEnd = globalRegex.lastIndex;
+      const afterMatch = input.slice(matchEnd);
+
+      if (startsWithExplicitTime(afterMatch)) {
+        result += input.slice(lastIndex, matchEnd);
+      } else {
+        result += input.slice(lastIndex, matchStart) + replacement;
+      }
+
+      lastIndex = matchEnd;
+    }
+
+    return result + input.slice(lastIndex);
+  };
+
+  guardedReplacements.forEach(replacement => {
+    normalized = applyGuardedReplacement(normalized, replacement);
   });
+
+  // Unambiguous tokens can always be replaced because they already denote a
+  // specific time-of-day.
+  normalized = normalized.replace(/\bnoon\b/gi, '12pm');
+  normalized = normalized.replace(/\bmidnight\b/gi, '12am');
 
   return normalized.trim();
 }
