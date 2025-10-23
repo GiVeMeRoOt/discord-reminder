@@ -136,7 +136,12 @@ function parseReminderDateTime(timeInputRaw, baseIST) {
     return null;
   }
 
-  let dt = DateTime.fromJSDate(parsedDate).setZone('Asia/Kolkata', { keepLocalTime: true });
+  // Convert the parsed instant into IST. We intentionally allow Luxon to shift
+  // the underlying instant when changing zones (do NOT keep local time),
+  // otherwise relative expressions such as "in 10 mins" end up many hours
+  // away. Chrono already returns the correct absolute instant, so we simply
+  // represent it in the IST zone.
+  let dt = DateTime.fromJSDate(parsedDate).setZone('Asia/Kolkata');
 
   // Use chrono certainty flags to determine whether the user explicitly
   // provided the time components. If not, reuse the current IST time-of-day so
