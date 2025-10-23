@@ -61,6 +61,106 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
+// --- Natural language parsing helpers ---
+/**
+ * Normalize user provided natural language so that chrono-node can parse a wider
+ * variety of casual phrases. This function purposely keeps the text friendly while
+ * inserting helpful hints (e.g. default hours for "tonight") and spacing digits
+ * from words (e.g. "in10" -> "in 10").
+ *
+ * @param {string} rawInput - The raw string received from the slash command.
+ * @returns {string} Sanitized input that chrono-node can understand better.
+ */
+function normalizeTimeInput(rawInput) {
+  if (!rawInput) return '';
+
+  let normalized = rawInput.trim();
+
+  // Collapse multiple spaces and ensure there is always a space between digits
+  // and characters so expressions such as "in10mins" or "feb18" are readable.
+  normalized = normalized.replace(/\s+/g, ' ');
+  normalized = normalized.replace(/([a-zA-Z])(\d)/g, '$1 $2');
+  normalized = normalized.replace(/(\d)([a-zA-Z])/g, '$1 $2');
+
+  // Helpful replacements for common natural phrases which chrono does not
+  // always interpret as expected.
+  const replacements = [
+    { regex: /\btonight\b/gi, replacement: 'today at 9pm' },
+    { regex: /\bthis\s+evening\b/gi, replacement: 'today at 7pm' },
+    { regex: /\bthis\s+afternoon\b/gi, replacement: 'today at 3pm' },
+    { regex: /\bthis\s+morning\b/gi, replacement: 'today at 9am' },
+    { regex: /\bthis\s+night\b/gi, replacement: 'today at 9pm' },
+    { regex: /\btomorrow\s+morning\b/gi, replacement: 'tomorrow at 9am' },
+    { regex: /\btomorrow\s+afternoon\b/gi, replacement: 'tomorrow at 3pm' },
+    { regex: /\btomorrow\s+evening\b/gi, replacement: 'tomorrow at 7pm' },
+    { regex: /\btomorrow\s+night\b/gi, replacement: 'tomorrow at 9pm' },
+    { regex: /\bnoon\b/gi, replacement: '12pm' },
+    { regex: /\bmidnight\b/gi, replacement: '12am' }
+  ];
+
+  replacements.forEach(({ regex, replacement }) => {
+    normalized = normalized.replace(regex, replacement);
+  });
+
+  return normalized.trim();
+}
+
+/**
+ * Parse the normalized text using chrono-node, taking into account the user's
+ * timezone (IST) and adding reasonable defaults if the user omitted any part of
+ * the time (for example "next monday" keeps the current time-of-day).
+ *
+ * @param {string} timeInputRaw - Raw input from the slash command.
+ * @param {DateTime} baseIST - Current time in IST, used as reference.
+ * @returns {DateTime|null} Parsed DateTime or null if parsing failed.
+ */
+function parseReminderDateTime(timeInputRaw, baseIST) {
+  const normalizedInput = normalizeTimeInput(timeInputRaw);
+  if (!normalizedInput) {
+    return null;
+  }
+
+  const results = chrono.parse(normalizedInput, baseIST.toJSDate(), { forwardDate: true });
+  if (!results || results.length === 0) {
+    return null;
+  }
+
+  const parsedResult = results[0];
+  const parsedDate = parsedResult.date();
+  const start = parsedResult.start;
+  if (!parsedDate) {
+    return null;
+  }
+
+  if (!start) {
+    return null;
+  }
+
+  let dt = DateTime.fromJSDate(parsedDate).setZone('Asia/Kolkata', { keepLocalTime: true });
+
+  // Use chrono certainty flags to determine whether the user explicitly
+  // provided the time components. If not, reuse the current IST time-of-day so
+  // commands such as "next week" or "on Friday" fire at the same hour.
+  if (!start.isCertain('hour')) {
+    dt = dt.set({
+      hour: baseIST.hour,
+      minute: baseIST.minute,
+      second: baseIST.second,
+      millisecond: baseIST.millisecond
+    });
+  } else {
+    // If the hour was present but minutes/seconds were not, normalise to :00
+    // to avoid ambiguous times such as "at 5" (which chrono interprets as 5:00).
+    if (!start.isCertain('minute')) {
+      dt = dt.set({ minute: 0, second: 0, millisecond: 0 });
+    } else if (!start.isCertain('second')) {
+      dt = dt.set({ second: 0, millisecond: 0 });
+    }
+  }
+
+  return dt;
+}
+
 // --- Helper: Schedule a Reminder ---
 // Reminder object: { id, userId, channelId, remindAt (ISO string), title (optional) }
 function scheduleReminder(reminder) {
@@ -160,42 +260,22 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isCommand()) {
     if (interaction.commandName === 'rme') {
       try {
-        let timeInputRaw = interaction.options.getString('time');
+        const timeInputRaw = interaction.options.getString('time');
         const title = interaction.options.getString('title'); // optional title
 
-        // Pre-process input: insert a space if needed (e.g., "in10 days" → "in 10 days")
-        const timeInput = timeInputRaw.replace(/in(\d+)/i, "in $1");
-
-        // Create a base reference in IST.
+        // Create a base reference in IST and attempt to parse the natural language input.
         const baseIST = DateTime.now().setZone('Asia/Kolkata');
-        // Parse the input relative to the base IST date.
-        let parsedJSDate = chrono.parseDate(timeInput, baseIST.toJSDate());
-        if (!parsedJSDate) {
+        let dt = parseReminderDateTime(timeInputRaw, baseIST);
+        if (!dt) {
           await interaction.reply({ content: 'Sorry, I could not understand that time. Please try a different format.', ephemeral: true });
           return;
         }
-        // Convert the parsed date to a Luxon DateTime (initially in the server’s zone)
-        let dt = DateTime.fromJSDate(parsedJSDate);
-        // Force interpretation as IST by keeping the local time
-        dt = dt.setZone('Asia/Kolkata', { keepLocalTime: true });
-        
-        // If no explicit time-of-day is mentioned (e.g., "feb 18th" or "in 10 days"), use the current IST time-of-day.
-        const timeMentioned = /(\d{1,2}(:\d{2})?\s*(am|pm))/i.test(timeInput);
-        if (!timeMentioned) {
-          dt = dt.set({
-            hour: baseIST.hour,
-            minute: baseIST.minute,
-            second: baseIST.second,
-            millisecond: baseIST.millisecond
-          });
-        }
-        
-        // At this point, dt should represent the intended reminder time in IST.
-        // If the resulting time is still before now (in IST), adjust by adding one day.
+        // If the resulting time is still before now (in IST), adjust by adding one day
+        // so vague phrases such as "today evening" still occur in the future.
         if (dt <= baseIST) {
           dt = dt.plus({ days: 1 });
         }
-        
+
         const finalISTDate = dt.toJSDate();
         if (finalISTDate <= new Date()) {
           await interaction.reply({ content: 'The time specified is in the past. Please enter a future time.', ephemeral: true });
