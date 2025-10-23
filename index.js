@@ -226,12 +226,14 @@ function parseReminderDateTime(timeInputRaw, baseIST) {
     return null;
   }
 
-  // Convert the parsed instant into IST. We intentionally allow Luxon to shift
-  // the underlying instant when changing zones (do NOT keep local time),
-  // otherwise relative expressions such as "in 10 mins" end up many hours
-  // away. Chrono already returns the correct absolute instant, so we simply
-  // represent it in the IST zone.
-  let dt = DateTime.fromJSDate(parsedDate).setZone('Asia/Kolkata');
+  // Chrono omits timezone information for most casual phrases ("tomorrow at 5pm"
+  // or "next monday"), which means the Date instance we receive is expressed in
+  // the server's local zone (UTC on the bot host). In those cases we must keep the
+  // clock time intact when moving into IST. For results that *do* carry a concrete
+  // offset (e.g. "in 10 mins", "5pm UTC") we let Luxon shift the instant so that
+  // relative phrases remain accurate.
+  const keepLocalTime = !start.isCertain('timezoneOffset');
+  let dt = DateTime.fromJSDate(parsedDate).setZone('Asia/Kolkata', { keepLocalTime });
 
   // Use chrono certainty flags to determine whether the user explicitly
   // provided the time components. If not, reuse the current IST time-of-day so
