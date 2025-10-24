@@ -425,25 +425,33 @@ function scheduleReminder(reminder) {
         }
         let reminderText = reminder.title ? `Reminder: **${reminder.title}**` : "Reminder: It's time!";
         
-        const row = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder()
-              .setCustomId(`snooze_30_${reminder.id}`)
-              .setLabel('Snooze 30 mins')
-              .setStyle(ButtonStyle.Primary),
-            new ButtonBuilder()
-              .setCustomId(`snooze_120_${reminder.id}`)
-              .setLabel('Snooze 2 hours')
-              .setStyle(ButtonStyle.Primary),
-            new ButtonBuilder()
-              .setCustomId(`snooze_1440_${reminder.id}`)
-              .setLabel('Snooze 1 day')
-              .setStyle(ButtonStyle.Primary),
+        const reminderButtons = [
+          new ButtonBuilder()
+            .setCustomId(`snooze_30_${reminder.id}`)
+            .setLabel('Snooze 30 mins')
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder()
+            .setCustomId(`snooze_120_${reminder.id}`)
+            .setLabel('Snooze 2 hours')
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder()
+            .setCustomId(`snooze_1440_${reminder.id}`)
+            .setLabel('Snooze 1 day')
+            .setStyle(ButtonStyle.Primary)
+        ];
+
+        if (reminder?.recurrence?.type) {
+          // Only show the cancel control for recurring reminders so one-off
+          // reminders keep their simple "snooze or let it dismiss" experience.
+          reminderButtons.push(
             new ButtonBuilder()
               .setCustomId(`cancel_${reminder.id}`)
               .setLabel('Cancel reminder')
               .setStyle(ButtonStyle.Danger)
           );
+        }
+
+        const row = new ActionRowBuilder().addComponents(...reminderButtons);
         
         await channel.send({
           content: `<@${reminder.userId}> ${reminderText}`,
