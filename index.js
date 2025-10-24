@@ -17,6 +17,69 @@ require('dotenv').config();
 // Global map to store scheduled jobs (key: reminder id, value: job object)
 const scheduledJobs = new Map();
 
+/**
+ * Cancel and remove any existing scheduled job for the provided reminder ID.
+ * A thin wrapper keeps call-sites concise and guards against missing jobs.
+ *
+ * @param {string} reminderId - The reminder identifier whose job should stop.
+ */
+function cancelScheduledJob(reminderId) {
+  const existingJob = scheduledJobs.get(reminderId);
+  if (existingJob && typeof existingJob.cancel === 'function') {
+    existingJob.cancel();
+  }
+  scheduledJobs.delete(reminderId);
+}
+
+/**
+ * Locate the backing storage message for a reminder.
+ *
+ * @param {import('discord.js').TextBasedChannel} storageChannel - Channel that stores reminders.
+ * @param {string} reminderId - The reminder identifier to look up.
+ * @param {string} [expectedUserId] - Optional user ID to enforce ownership.
+ * @returns {Promise<{ message: import('discord.js').Message, data: object } | null>}
+ */
+async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUserId) {
+  if (!storageChannel || !storageChannel.isTextBased()) {
+    return null;
+  }
+
+  const messages = await storageChannel.messages.fetch({ limit: 100 });
+  for (const message of messages.values()) {
+    try {
+      const data = JSON.parse(message.content);
+      if (data.id === reminderId && (!expectedUserId || data.userId === expectedUserId)) {
+        return { message, data };
+      }
+    } catch (err) {
+      // Ignore messages that are not JSON payloads managed by the bot.
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Provide a short human-readable description for a snooze duration.
+ * Currently normalises the set of preset snooze button durations.
+ *
+ * @param {number} durationMs - Snooze length in milliseconds.
+ * @returns {string}
+ */
+function describeSnoozeDuration(durationMs) {
+  const minutes = Math.round(durationMs / 60000);
+  if (minutes % 1440 === 0) {
+    const days = minutes / 1440;
+    return days === 1 ? '1 day' : `${days} days`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return hours === 1 ? '1 hour' : `${hours} hours`;
+  }
+  return minutes === 1 ? '1 minute' : `${minutes} minutes`;
+}
+
 // The ID of the channel where reminder data is stored (from .env)
 const STORAGE_CHANNEL_ID = process.env.REMINDER_STORAGE_CHANNEL_ID;
 
@@ -350,13 +413,7 @@ function scheduleReminder(reminder) {
     }
     if (remindAt <= new Date()) return; // Do not schedule if time has passed
 
-    if (scheduledJobs.has(reminder.id)) {
-      const existingJob = scheduledJobs.get(reminder.id);
-      if (existingJob && typeof existingJob.cancel === 'function') {
-        existingJob.cancel();
-      }
-      scheduledJobs.delete(reminder.id);
-    }
+    cancelScheduledJob(reminder.id);
 
     const job = schedule.scheduleJob(remindAt, async function () {
       scheduledJobs.delete(reminder.id);
@@ -381,7 +438,11 @@ function scheduleReminder(reminder) {
             new ButtonBuilder()
               .setCustomId(`snooze_1440_${reminder.id}`)
               .setLabel('Snooze 1 day')
-              .setStyle(ButtonStyle.Primary)
+              .setStyle(ButtonStyle.Primary),
+            new ButtonBuilder()
+              .setCustomId(`cancel_${reminder.id}`)
+              .setLabel('Cancel reminder')
+              .setStyle(ButtonStyle.Danger)
           );
         
         await channel.send({
@@ -564,24 +625,13 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'Storage channel not available. Cannot delete reminder.', ephemeral: true });
           return;
         }
-        const messages = await storageChannel.messages.fetch({ limit: 100 });
-        const storageMessage = messages.find(m => {
-          try {
-            const data = JSON.parse(m.content);
-            return data.id === reminderId && data.userId === interaction.user.id;
-          } catch (e) {
-            return false;
-          }
-        });
-        if (!storageMessage) {
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        if (!storedReminder) {
           await interaction.reply({ content: `No reminder found with ID \`${reminderId}\` for you.`, ephemeral: true });
           return;
         }
-        if (scheduledJobs.has(reminderId)) {
-          scheduledJobs.get(reminderId).cancel();
-          scheduledJobs.delete(reminderId);
-        }
-        await storageMessage.delete();
+        cancelScheduledJob(reminderId);
+        await storedReminder.message.delete();
         await interaction.reply({ content: `Your reminder with ID \`${reminderId}\` has been deleted.`, ephemeral: true });
       } catch (err) {
         console.error('Error handling /delrme command:', err);
@@ -609,31 +659,53 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'Storage channel not available.', ephemeral: true });
           return;
         }
-        const messages = await storageChannel.messages.fetch({ limit: 100 });
-        const storageMessage = messages.find(m => {
-          try {
-            const data = JSON.parse(m.content);
-            return data.id === reminderId && data.userId === interaction.user.id;
-          } catch (e) {
-            return false;
-          }
-        });
-        if (!storageMessage) {
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        if (!storedReminder) {
           await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', ephemeral: true });
           return;
         }
         const newDate = new Date(Date.now() + snoozeTimeMs);
-        const updatedReminder = JSON.parse(storageMessage.content);
+        const updatedReminder = { ...storedReminder.data };
         updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata', { keepLocalTime: true }).toISO();
-        await storageMessage.edit(JSON.stringify(updatedReminder));
+        updatedReminder.triggered = false;
+        await storedReminder.message.edit(JSON.stringify(updatedReminder));
         scheduleReminder(updatedReminder);
-        await interaction.update({ content: `<@${interaction.user.id}> Reminder snoozed for ${snoozeTimeMs/60000} minutes.`, components: [] });
+        const snoozeDescription = describeSnoozeDuration(snoozeTimeMs);
+        const snoozedUntilUnix = Math.floor(newDate.getTime() / 1000);
+        await interaction.update({ content: `<@${interaction.user.id}> Reminder snoozed until <t:${snoozedUntilUnix}:F> (${snoozeDescription}).`, components: [] });
       } catch (err) {
         console.error('Error handling snooze button:', err);
         try {
           await interaction.reply({ content: 'An error occurred while snoozing your reminder. Please try again later.', ephemeral: true });
         } catch (replyErr) {
           console.error('Error sending snooze error reply:', replyErr);
+        }
+      }
+    } else if (customId.startsWith('cancel_')) {
+      const reminderId = customId.slice('cancel_'.length);
+      try {
+        const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
+        if (!storageChannel || !storageChannel.isTextBased()) {
+          await interaction.reply({ content: 'Storage channel not available.', ephemeral: true });
+          return;
+        }
+
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        if (!storedReminder) {
+          await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to cancel it.', ephemeral: true });
+          return;
+        }
+
+        cancelScheduledJob(reminderId);
+        await storedReminder.message.delete();
+
+        await interaction.update({ content: `<@${interaction.user.id}> Reminder cancelled.`, components: [] });
+      } catch (err) {
+        console.error('Error handling cancel button:', err);
+        try {
+          await interaction.reply({ content: 'An error occurred while cancelling your reminder. Please try again later.', ephemeral: true });
+        } catch (replyErr) {
+          console.error('Error sending cancel error reply:', replyErr);
         }
       }
     }
