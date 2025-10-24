@@ -17,6 +17,69 @@ require('dotenv').config();
 // Global map to store scheduled jobs (key: reminder id, value: job object)
 const scheduledJobs = new Map();
 
+/**
+ * Cancel and remove any existing scheduled job for the provided reminder ID.
+ * A thin wrapper keeps call-sites concise and guards against missing jobs.
+ *
+ * @param {string} reminderId - The reminder identifier whose job should stop.
+ */
+function cancelScheduledJob(reminderId) {
+  const existingJob = scheduledJobs.get(reminderId);
+  if (existingJob && typeof existingJob.cancel === 'function') {
+    existingJob.cancel();
+  }
+  scheduledJobs.delete(reminderId);
+}
+
+/**
+ * Locate the backing storage message for a reminder.
+ *
+ * @param {import('discord.js').TextBasedChannel} storageChannel - Channel that stores reminders.
+ * @param {string} reminderId - The reminder identifier to look up.
+ * @param {string} [expectedUserId] - Optional user ID to enforce ownership.
+ * @returns {Promise<{ message: import('discord.js').Message, data: object } | null>}
+ */
+async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUserId) {
+  if (!storageChannel || !storageChannel.isTextBased()) {
+    return null;
+  }
+
+  const messages = await storageChannel.messages.fetch({ limit: 100 });
+  for (const message of messages.values()) {
+    try {
+      const data = JSON.parse(message.content);
+      if (data.id === reminderId && (!expectedUserId || data.userId === expectedUserId)) {
+        return { message, data };
+      }
+    } catch (err) {
+      // Ignore messages that are not JSON payloads managed by the bot.
+      continue;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Provide a short human-readable description for a snooze duration.
+ * Currently normalises the set of preset snooze button durations.
+ *
+ * @param {number} durationMs - Snooze length in milliseconds.
+ * @returns {string}
+ */
+function describeSnoozeDuration(durationMs) {
+  const minutes = Math.round(durationMs / 60000);
+  if (minutes % 1440 === 0) {
+    const days = minutes / 1440;
+    return days === 1 ? '1 day' : `${days} days`;
+  }
+  if (minutes % 60 === 0) {
+    const hours = minutes / 60;
+    return hours === 1 ? '1 hour' : `${hours} hours`;
+  }
+  return minutes === 1 ? '1 minute' : `${minutes} minutes`;
+}
+
 // The ID of the channel where reminder data is stored (from .env)
 const STORAGE_CHANNEL_ID = process.env.REMINDER_STORAGE_CHANNEL_ID;
 
@@ -37,7 +100,19 @@ const commands = [
     .addStringOption(option =>
       option.setName('title')
             .setDescription('Optional title for the reminder')
-            .setRequired(false)),
+            .setRequired(false))
+    .addStringOption(option =>
+      option.setName('repeat')
+            .setDescription('Repeat interval for the reminder')
+            .setRequired(false)
+            .addChoices(
+              { name: 'Every hour', value: 'hourly' },
+              { name: 'Every day', value: 'daily' },
+              { name: 'Weekdays (Mon-Fri)', value: 'weekday' },
+              { name: 'Every week', value: 'weekly' },
+              { name: 'Every month', value: 'monthly' },
+              { name: 'Every year', value: 'yearly' }
+            )),
   new SlashCommandBuilder()
     .setName('delrme')
     .setDescription('Delete a reminder by its ID')
@@ -258,14 +333,90 @@ function parseReminderDateTime(timeInputRaw, baseIST) {
   return dt;
 }
 
+/**
+ * Describe a recurrence pattern in a user friendly manner for acknowledgement
+ * messages and logs.
+ *
+ * @param {string} recurrenceType - The recurrence identifier.
+ * @returns {string} Human readable description.
+ */
+function describeRecurrence(recurrenceType) {
+  switch (recurrenceType) {
+    case 'hourly':
+      return 'every hour';
+    case 'daily':
+      return 'every day';
+    case 'weekday':
+      return 'every weekday';
+    case 'weekly':
+      return 'every week';
+    case 'monthly':
+      return 'every month';
+    case 'yearly':
+      return 'every year';
+    default:
+      return 'on a repeating schedule';
+  }
+}
+
+/**
+ * Compute the next DateTime (in IST) for a given recurrence pattern.
+ *
+ * @param {DateTime} currentIST - The current scheduled DateTime in IST.
+ * @param {string} recurrenceType - Recurrence identifier.
+ * @returns {DateTime|null} The next scheduled time or null when not possible.
+ */
+function getNextRecurrenceDateTime(currentIST, recurrenceType) {
+  if (!currentIST || !currentIST.isValid) {
+    return null;
+  }
+
+  switch (recurrenceType) {
+    case 'hourly':
+      return currentIST.plus({ hours: 1 });
+    case 'daily':
+      return currentIST.plus({ days: 1 });
+    case 'weekday': {
+      let next = currentIST.plus({ days: 1 });
+      let guard = 0;
+      while (next.weekday > 5) {
+        next = next.plus({ days: 1 });
+        guard += 1;
+        if (guard > 7) {
+          return null;
+        }
+      }
+      return next;
+    }
+    case 'weekly':
+      return currentIST.plus({ weeks: 1 });
+    case 'monthly':
+      return currentIST.plus({ months: 1 });
+    case 'yearly':
+      return currentIST.plus({ years: 1 });
+    default:
+      return null;
+  }
+}
+
 // --- Helper: Schedule a Reminder ---
 // Reminder object: { id, userId, channelId, remindAt (ISO string), title (optional) }
 function scheduleReminder(reminder) {
   try {
+    if (!reminder || !reminder.remindAt) {
+      return;
+    }
     const remindAt = new Date(reminder.remindAt);
+    if (Number.isNaN(remindAt.getTime())) {
+      console.error(`Invalid reminder time for reminder ${reminder.id}`);
+      return;
+    }
     if (remindAt <= new Date()) return; // Do not schedule if time has passed
 
+    cancelScheduledJob(reminder.id);
+
     const job = schedule.scheduleJob(remindAt, async function () {
+      scheduledJobs.delete(reminder.id);
       try {
         const channel = await client.channels.fetch(reminder.channelId);
         if (!channel) {
@@ -274,21 +425,33 @@ function scheduleReminder(reminder) {
         }
         let reminderText = reminder.title ? `Reminder: **${reminder.title}**` : "Reminder: It's time!";
         
-        const row = new ActionRowBuilder()
-          .addComponents(
+        const reminderButtons = [
+          new ButtonBuilder()
+            .setCustomId(`snooze_30_${reminder.id}`)
+            .setLabel('Snooze 30 mins')
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder()
+            .setCustomId(`snooze_120_${reminder.id}`)
+            .setLabel('Snooze 2 hours')
+            .setStyle(ButtonStyle.Primary),
+          new ButtonBuilder()
+            .setCustomId(`snooze_1440_${reminder.id}`)
+            .setLabel('Snooze 1 day')
+            .setStyle(ButtonStyle.Primary)
+        ];
+
+        if (reminder?.recurrence?.type) {
+          // Only show the cancel control for recurring reminders so one-off
+          // reminders keep their simple "snooze or let it dismiss" experience.
+          reminderButtons.push(
             new ButtonBuilder()
-              .setCustomId(`snooze_30_${reminder.id}`)
-              .setLabel('Snooze 30 mins')
-              .setStyle(ButtonStyle.Primary),
-            new ButtonBuilder()
-              .setCustomId(`snooze_120_${reminder.id}`)
-              .setLabel('Snooze 2 hours')
-              .setStyle(ButtonStyle.Primary),
-            new ButtonBuilder()
-              .setCustomId(`snooze_1440_${reminder.id}`)
-              .setLabel('Snooze 1 day')
-              .setStyle(ButtonStyle.Primary)
+              .setCustomId(`cancel_${reminder.id}`)
+              .setLabel('Cancel reminder')
+              .setStyle(ButtonStyle.Danger)
           );
+        }
+
+        const row = new ActionRowBuilder().addComponents(...reminderButtons);
         
         await channel.send({
           content: `<@${reminder.userId}> ${reminderText}`,
@@ -309,11 +472,35 @@ function scheduleReminder(reminder) {
           });
           if (storageMessage) {
             const currentData = JSON.parse(storageMessage.content);
-            currentData.triggered = true;
-            await storageMessage.edit(JSON.stringify(currentData));
+            const recurrenceType = currentData?.recurrence?.type;
+            if (recurrenceType) {
+              let nextIST = DateTime.fromISO(reminder.remindAt).setZone('Asia/Kolkata');
+              let iterations = 0;
+              const nowIST = DateTime.now().setZone('Asia/Kolkata');
+
+              do {
+                nextIST = getNextRecurrenceDateTime(nextIST, recurrenceType);
+                iterations += 1;
+                if (!nextIST) {
+                  break;
+                }
+              } while (nextIST <= nowIST && iterations < 400);
+
+              if (nextIST && iterations < 400) {
+                currentData.remindAt = nextIST.toISO();
+                currentData.triggered = false;
+                await storageMessage.edit(JSON.stringify(currentData));
+                scheduleReminder(currentData);
+              } else {
+                currentData.triggered = true;
+                await storageMessage.edit(JSON.stringify(currentData));
+              }
+            } else {
+              currentData.triggered = true;
+              await storageMessage.edit(JSON.stringify(currentData));
+            }
           }
         }
-        scheduledJobs.delete(reminder.id);
       } catch (err) {
         console.error(`Error sending reminder ${reminder.id}:`, err);
       }
@@ -340,6 +527,26 @@ client.once('ready', async () => {
         const remindAt = new Date(data.remindAt);
         if (remindAt > new Date()) {
           scheduleReminder(data);
+        } else if (data?.recurrence?.type) {
+          let nextIST = DateTime.fromISO(data.remindAt).setZone('Asia/Kolkata');
+          const nowIST = DateTime.now().setZone('Asia/Kolkata');
+          let iterations = 0;
+
+          do {
+            nextIST = getNextRecurrenceDateTime(nextIST, data.recurrence.type);
+            iterations += 1;
+            if (!nextIST) {
+              break;
+            }
+          } while (nextIST <= nowIST && iterations < 400);
+
+          if (nextIST && iterations < 400) {
+            data.remindAt = nextIST.toISO();
+            message.edit(JSON.stringify(data)).catch(console.error);
+            scheduleReminder(data);
+          } else {
+            message.delete().catch(console.error);
+          }
         } else {
           message.delete().catch(console.error);
         }
@@ -359,6 +566,7 @@ client.on('interactionCreate', async interaction => {
       try {
         const timeInputRaw = interaction.options.getString('time');
         const title = interaction.options.getString('title'); // optional title
+        const repeat = interaction.options.getString('repeat');
 
         // Create a base reference in IST and attempt to parse the natural language input.
         const baseIST = DateTime.now().setZone('Asia/Kolkata');
@@ -387,7 +595,9 @@ client.on('interactionCreate', async interaction => {
           channelId: interaction.channelId,
           // Store the reminder time as the ISO string with the IST offset.
           remindAt: dt.toISO(),
-          title: title || null
+          title: title || null,
+          recurrence: repeat ? { type: repeat } : null,
+          triggered: false
         };
 
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
@@ -397,11 +607,14 @@ client.on('interactionCreate', async interaction => {
         }
         await storageChannel.send(JSON.stringify(reminderData));
         scheduleReminder(reminderData);
-        
+
         // Acknowledge the reminder. If a title is provided, include it in the acknowledgement.
         let ackMsg = `Alright, <@${interaction.user.id}>, I will remind you <t:${Math.floor(finalISTDate.getTime()/1000)}:R>. (Reminder ID: \`${reminderId}\`)`;
         if (title) {
           ackMsg = `Alright, <@${interaction.user.id}>, I will remind you about **${title}** <t:${Math.floor(finalISTDate.getTime()/1000)}:R>. (Reminder ID: \`${reminderId}\`)`;
+        }
+        if (repeat) {
+          ackMsg += ` This reminder will repeat ${describeRecurrence(repeat)}.`;
         }
         await interaction.reply(ackMsg);
       } catch (err) {
@@ -420,24 +633,13 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'Storage channel not available. Cannot delete reminder.', ephemeral: true });
           return;
         }
-        const messages = await storageChannel.messages.fetch({ limit: 100 });
-        const storageMessage = messages.find(m => {
-          try {
-            const data = JSON.parse(m.content);
-            return data.id === reminderId && data.userId === interaction.user.id;
-          } catch (e) {
-            return false;
-          }
-        });
-        if (!storageMessage) {
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        if (!storedReminder) {
           await interaction.reply({ content: `No reminder found with ID \`${reminderId}\` for you.`, ephemeral: true });
           return;
         }
-        if (scheduledJobs.has(reminderId)) {
-          scheduledJobs.get(reminderId).cancel();
-          scheduledJobs.delete(reminderId);
-        }
-        await storageMessage.delete();
+        cancelScheduledJob(reminderId);
+        await storedReminder.message.delete();
         await interaction.reply({ content: `Your reminder with ID \`${reminderId}\` has been deleted.`, ephemeral: true });
       } catch (err) {
         console.error('Error handling /delrme command:', err);
@@ -465,31 +667,53 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'Storage channel not available.', ephemeral: true });
           return;
         }
-        const messages = await storageChannel.messages.fetch({ limit: 100 });
-        const storageMessage = messages.find(m => {
-          try {
-            const data = JSON.parse(m.content);
-            return data.id === reminderId && data.userId === interaction.user.id;
-          } catch (e) {
-            return false;
-          }
-        });
-        if (!storageMessage) {
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        if (!storedReminder) {
           await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', ephemeral: true });
           return;
         }
         const newDate = new Date(Date.now() + snoozeTimeMs);
-        const updatedReminder = JSON.parse(storageMessage.content);
+        const updatedReminder = { ...storedReminder.data };
         updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata', { keepLocalTime: true }).toISO();
-        await storageMessage.edit(JSON.stringify(updatedReminder));
+        updatedReminder.triggered = false;
+        await storedReminder.message.edit(JSON.stringify(updatedReminder));
         scheduleReminder(updatedReminder);
-        await interaction.update({ content: `<@${interaction.user.id}> Reminder snoozed for ${snoozeTimeMs/60000} minutes.`, components: [] });
+        const snoozeDescription = describeSnoozeDuration(snoozeTimeMs);
+        const snoozedUntilUnix = Math.floor(newDate.getTime() / 1000);
+        await interaction.update({ content: `<@${interaction.user.id}> Reminder snoozed until <t:${snoozedUntilUnix}:F> (${snoozeDescription}).`, components: [] });
       } catch (err) {
         console.error('Error handling snooze button:', err);
         try {
           await interaction.reply({ content: 'An error occurred while snoozing your reminder. Please try again later.', ephemeral: true });
         } catch (replyErr) {
           console.error('Error sending snooze error reply:', replyErr);
+        }
+      }
+    } else if (customId.startsWith('cancel_')) {
+      const reminderId = customId.slice('cancel_'.length);
+      try {
+        const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
+        if (!storageChannel || !storageChannel.isTextBased()) {
+          await interaction.reply({ content: 'Storage channel not available.', ephemeral: true });
+          return;
+        }
+
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        if (!storedReminder) {
+          await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to cancel it.', ephemeral: true });
+          return;
+        }
+
+        cancelScheduledJob(reminderId);
+        await storedReminder.message.delete();
+
+        await interaction.update({ content: `<@${interaction.user.id}> Reminder cancelled.`, components: [] });
+      } catch (err) {
+        console.error('Error handling cancel button:', err);
+        try {
+          await interaction.reply({ content: 'An error occurred while cancelling your reminder. Please try again later.', ephemeral: true });
+        } catch (replyErr) {
+          console.error('Error sending cancel error reply:', replyErr);
         }
       }
     }
