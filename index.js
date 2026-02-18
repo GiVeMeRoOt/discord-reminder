@@ -1,9 +1,9 @@
 // index.js
-const { 
-  Client, 
-  GatewayIntentBits, 
-  REST, 
-  Routes, 
+const {
+  Client,
+  GatewayIntentBits,
+  REST,
+  Routes,
   SlashCommandBuilder,
   ActionRowBuilder,
   ButtonBuilder,
@@ -39,25 +39,146 @@ function cancelScheduledJob(reminderId) {
  * @param {string} [expectedUserId] - Optional user ID to enforce ownership.
  * @returns {Promise<{ message: import('discord.js').Message, data: object } | null>}
  */
-async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUserId) {
+const STORAGE_FETCH_PAGE_SIZE = 100;
+const MAX_LOOKUP_PAGES = Number.parseInt(process.env.REMINDER_LOOKUP_MAX_PAGES || '50', 10);
+const MAX_STARTUP_SCAN_PAGES = Number.parseInt(process.env.REMINDER_STARTUP_SCAN_MAX_PAGES || '100', 10);
+
+/**
+ * Parse JSON payloads from storage messages and return null on invalid payloads.
+ *
+ * @param {import('discord.js').Message} message
+ * @returns {object|null}
+ */
+function parseStoredReminderData(message) {
+  try {
+    return JSON.parse(message.content);
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Fetch a storage message by id, parse it and optionally assert owner/reminder id.
+ *
+ * @param {import('discord.js').TextBasedChannel} storageChannel
+ * @param {string} messageId
+ * @param {string} reminderId
+ * @param {string} [expectedUserId]
+ * @returns {Promise<{ message: import('discord.js').Message, data: object } | null>}
+ */
+async function fetchStoredReminderByMessageId(storageChannel, messageId, reminderId, expectedUserId) {
+  if (!messageId) {
+    return null;
+  }
+
+  try {
+    const message = await storageChannel.messages.fetch(messageId);
+    const data = parseStoredReminderData(message);
+    if (!data || data.id !== reminderId) {
+      return null;
+    }
+    if (expectedUserId && data.userId !== expectedUserId) {
+      return null;
+    }
+    return { message, data };
+  } catch (err) {
+    return null;
+  }
+}
+
+async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUserId, options = {}) {
   if (!storageChannel || !storageChannel.isTextBased()) {
     return null;
   }
 
-  const messages = await storageChannel.messages.fetch({ limit: 100 });
-  for (const message of messages.values()) {
-    try {
-      const data = JSON.parse(message.content);
+  const { storageMessageId, maxPages = MAX_LOOKUP_PAGES } = options;
+
+  // Fast path for new reminders: directly fetch by the known storage message id.
+  const byMessageId = await fetchStoredReminderByMessageId(
+    storageChannel,
+    storageMessageId,
+    reminderId,
+    expectedUserId
+  );
+  if (byMessageId) {
+    return byMessageId;
+  }
+
+  // Fallback for old reminders that don't have storageMessageId persisted yet.
+  let before;
+  let pagesFetched = 0;
+  while (pagesFetched < maxPages) {
+    const messages = await storageChannel.messages.fetch({ limit: STORAGE_FETCH_PAGE_SIZE, before });
+    if (messages.size === 0) {
+      break;
+    }
+
+    for (const message of messages.values()) {
+      const data = parseStoredReminderData(message);
+      if (!data) {
+        continue;
+      }
+
       if (data.id === reminderId && (!expectedUserId || data.userId === expectedUserId)) {
         return { message, data };
       }
-    } catch (err) {
-      // Ignore messages that are not JSON payloads managed by the bot.
-      continue;
+    }
+
+    pagesFetched += 1;
+    before = messages.last()?.id;
+    if (!before || messages.size < STORAGE_FETCH_PAGE_SIZE) {
+      break;
     }
   }
 
+  if (pagesFetched >= maxPages) {
+    console.warn(`Stopped reminder lookup for ${reminderId} after ${maxPages} pages.`);
+  }
+
   return null;
+}
+
+/**
+ * Iterate through JSON reminder payloads stored in the storage channel.
+ * The scan is paginated and capped to protect startup from excessive history.
+ *
+ * @param {import('discord.js').TextBasedChannel} storageChannel
+ * @param {(message: import('discord.js').Message, data: object) => Promise<void>} visitor
+ * @param {{ maxPages?: number }} [options]
+ * @returns {Promise<void>}
+ */
+async function forEachStoredReminder(storageChannel, visitor, options = {}) {
+  if (!storageChannel || !storageChannel.isTextBased()) {
+    return;
+  }
+
+  const { maxPages = MAX_STARTUP_SCAN_PAGES } = options;
+
+  let before;
+  let pagesFetched = 0;
+  while (pagesFetched < maxPages) {
+    const messages = await storageChannel.messages.fetch({ limit: STORAGE_FETCH_PAGE_SIZE, before });
+    if (messages.size === 0) {
+      return;
+    }
+
+    for (const message of messages.values()) {
+      const data = parseStoredReminderData(message);
+      if (!data) {
+        continue;
+      }
+
+      await visitor(message, data);
+    }
+
+    pagesFetched += 1;
+    before = messages.last()?.id;
+    if (!before || messages.size < STORAGE_FETCH_PAGE_SIZE) {
+      return;
+    }
+  }
+
+  console.warn(`Stopped startup reminder scan after ${maxPages} pages.`);
 }
 
 /**
@@ -424,7 +545,7 @@ function scheduleReminder(reminder) {
           return;
         }
         let reminderText = reminder.title ? `Reminder: **${reminder.title}**` : "Reminder: It's time!";
-        
+
         const reminderButtons = [
           new ButtonBuilder()
             .setCustomId(`snooze_30_${reminder.id}`)
@@ -452,7 +573,7 @@ function scheduleReminder(reminder) {
         }
 
         const row = new ActionRowBuilder().addComponents(...reminderButtons);
-        
+
         await channel.send({
           content: `<@${reminder.userId}> ${reminderText}`,
           components: [row]
@@ -461,17 +582,16 @@ function scheduleReminder(reminder) {
         // Update storage message to mark as triggered.
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (storageChannel && storageChannel.isTextBased()) {
-          const messages = await storageChannel.messages.fetch({ limit: 100 });
-          const storageMessage = messages.find(m => {
-            try {
-              const data = JSON.parse(m.content);
-              return data.id === reminder.id;
-            } catch (e) {
-              return false;
+          const storedReminder = await fetchStoredReminderMessage(storageChannel, reminder.id, undefined, { storageMessageId: reminder.storageMessageId });
+          if (storedReminder) {
+            const currentData = storedReminder.data;
+
+            // Persist storage message id when absent so future lookups are O(1).
+            if (!currentData.storageMessageId) {
+              currentData.storageMessageId = storedReminder.message.id;
+              await storedReminder.message.edit(JSON.stringify(currentData));
             }
-          });
-          if (storageMessage) {
-            const currentData = JSON.parse(storageMessage.content);
+
             const recurrenceType = currentData?.recurrence?.type;
             if (recurrenceType) {
               let nextIST = DateTime.fromISO(reminder.remindAt).setZone('Asia/Kolkata');
@@ -489,16 +609,19 @@ function scheduleReminder(reminder) {
               if (nextIST && iterations < 400) {
                 currentData.remindAt = nextIST.toISO();
                 currentData.triggered = false;
-                await storageMessage.edit(JSON.stringify(currentData));
+                await storedReminder.message.edit(JSON.stringify(currentData));
                 scheduleReminder(currentData);
               } else {
                 currentData.triggered = true;
-                await storageMessage.edit(JSON.stringify(currentData));
+                await storedReminder.message.edit(JSON.stringify(currentData));
               }
             } else {
               currentData.triggered = true;
-              await storageMessage.edit(JSON.stringify(currentData));
+              await storedReminder.message.edit(JSON.stringify(currentData));
             }
+          } else {
+            // If the backing record was deleted, do not reschedule the reminder.
+            console.warn(`Storage record not found for reminder ${reminder.id}; skipping recurrence update.`);
           }
         }
       } catch (err) {
@@ -520,10 +643,7 @@ client.once('ready', async () => {
       console.error('Storage channel not found or is not text-based.');
       return;
     }
-    const messages = await storageChannel.messages.fetch({ limit: 100 });
-    messages.forEach(message => {
-      try {
-        const data = JSON.parse(message.content);
+    await forEachStoredReminder(storageChannel, async (message, data) => {
         const remindAt = new Date(data.remindAt);
         if (remindAt > new Date()) {
           scheduleReminder(data);
@@ -550,9 +670,7 @@ client.once('ready', async () => {
         } else {
           message.delete().catch(console.error);
         }
-      } catch (err) {
-        console.error('Error parsing storage message:', err);
-      }
+
     });
   } catch (err) {
     console.error('Error fetching reminders from storage channel:', err);
@@ -586,7 +704,7 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'The time specified is in the past. Please enter a future time.', ephemeral: true });
           return;
         }
-        
+
         // Generate a unique reminder ID.
         const reminderId = Date.now().toString();
         const reminderData = {
@@ -605,7 +723,10 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'Storage channel not available. Cannot set reminder.', ephemeral: true });
           return;
         }
-        await storageChannel.send(JSON.stringify(reminderData));
+        const storageMessage = await storageChannel.send(JSON.stringify(reminderData));
+        reminderData.storageMessageId = storageMessage.id;
+        await storageMessage.edit(JSON.stringify(reminderData));
+
         scheduleReminder(reminderData);
 
         // Acknowledge the reminder. If a title is provided, include it in the acknowledgement.
