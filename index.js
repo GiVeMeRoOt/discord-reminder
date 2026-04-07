@@ -97,7 +97,7 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
     if (maxPages === Infinity) {
       pageLimit = Infinity;
     } else if (Number.isFinite(maxPages)) {
-      pageLimit = maxPages;
+      pageLimit = Math.trunc(maxPages);
     } else {
       // Preserve previous behavior for invalid values: skip paginated fallback.
       pageLimit = 0;
@@ -142,7 +142,7 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
     }
   }
 
-  if (Number.isFinite(pageLimit) && pagesFetched >= pageLimit) {
+  if (Number.isFinite(pageLimit) && pageLimit > 0 && pagesFetched >= pageLimit) {
     console.warn(`Stopped reminder lookup for ${reminderId} after ${pageLimit} pages.`);
   }
 
