@@ -805,9 +805,13 @@ client.on('interactionCreate', async interaction => {
           await interaction.editReply({ content: 'Storage channel not available.', components: [] });
           return;
         }
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, undefined, { maxPages: Infinity });
         if (!storedReminder) {
-          await interaction.editReply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', components: [] });
+          await interaction.editReply({ content: 'This reminder no longer exists.', components: [] });
+          return;
+        }
+        if (storedReminder.data.userId !== interaction.user.id) {
+          await interaction.followUp({ content: 'You are not authorized to snooze this reminder.', ephemeral: true });
           return;
         }
         const newDate = new Date(Date.now() + snoozeTimeMs);
@@ -843,9 +847,13 @@ client.on('interactionCreate', async interaction => {
           return;
         }
 
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, undefined, { maxPages: Infinity });
         if (!storedReminder) {
-          await interaction.editReply({ content: 'This reminder no longer exists or you are not authorized to cancel it.', components: [] });
+          await interaction.editReply({ content: 'This reminder no longer exists.', components: [] });
+          return;
+        }
+        if (storedReminder.data.userId !== interaction.user.id) {
+          await interaction.followUp({ content: 'You are not authorized to cancel this reminder.', ephemeral: true });
           return;
         }
 
