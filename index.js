@@ -92,6 +92,7 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
   }
 
   const { storageMessageId, maxPages = MAX_LOOKUP_PAGES } = options;
+  const pageLimit = Number.isFinite(maxPages) && maxPages > 0 ? maxPages : Infinity;
 
   // Fast path for new reminders: directly fetch by the known storage message id.
   const byMessageId = await fetchStoredReminderByMessageId(
@@ -107,7 +108,7 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
   // Fallback for old reminders that don't have storageMessageId persisted yet.
   let before;
   let pagesFetched = 0;
-  while (pagesFetched < maxPages) {
+  while (pagesFetched < pageLimit) {
     const messages = await storageChannel.messages.fetch({ limit: STORAGE_FETCH_PAGE_SIZE, before });
     if (messages.size === 0) {
       break;
@@ -131,8 +132,8 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
     }
   }
 
-  if (pagesFetched >= maxPages) {
-    console.warn(`Stopped reminder lookup for ${reminderId} after ${maxPages} pages.`);
+  if (Number.isFinite(pageLimit) && pagesFetched >= pageLimit) {
+    console.warn(`Stopped reminder lookup for ${reminderId} after ${pageLimit} pages.`);
   }
 
   return null;
@@ -748,24 +749,29 @@ client.on('interactionCreate', async interaction => {
       }
     } else if (interaction.commandName === 'delrme') {
       try {
+        await interaction.deferReply({ ephemeral: true });
         const reminderId = interaction.options.getString('id').trim();
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (!storageChannel || !storageChannel.isTextBased()) {
-          await interaction.reply({ content: 'Storage channel not available. Cannot delete reminder.', ephemeral: true });
+          await interaction.editReply({ content: 'Storage channel not available. Cannot delete reminder.' });
           return;
         }
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
         if (!storedReminder) {
-          await interaction.reply({ content: `No reminder found with ID \`${reminderId}\` for you.`, ephemeral: true });
+          await interaction.editReply({ content: `No reminder found with ID \`${reminderId}\` for you.` });
           return;
         }
         cancelScheduledJob(reminderId);
         await storedReminder.message.delete();
-        await interaction.reply({ content: `Your reminder with ID \`${reminderId}\` has been deleted.`, ephemeral: true });
+        await interaction.editReply({ content: `Your reminder with ID \`${reminderId}\` has been deleted.` });
       } catch (err) {
         console.error('Error handling /delrme command:', err);
         try {
-          await interaction.reply({ content: 'An error occurred while deleting your reminder. Please try again later.', ephemeral: true });
+          if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ content: 'An error occurred while deleting your reminder. Please try again later.' });
+          } else {
+            await interaction.reply({ content: 'An error occurred while deleting your reminder. Please try again later.', ephemeral: true });
+          }
         } catch (replyErr) {
           console.error('Error sending error reply:', replyErr);
         }
@@ -783,29 +789,36 @@ client.on('interactionCreate', async interaction => {
       }
       const reminderId = parts.slice(2).join('_');
       try {
+        await interaction.deferUpdate();
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (!storageChannel || !storageChannel.isTextBased()) {
-          await interaction.reply({ content: 'Storage channel not available.', ephemeral: true });
+          await interaction.editReply({ content: 'Storage channel not available.', components: [] });
           return;
         }
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
         if (!storedReminder) {
-          await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', ephemeral: true });
+          await interaction.editReply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', components: [] });
           return;
         }
         const newDate = new Date(Date.now() + snoozeTimeMs);
         const updatedReminder = { ...storedReminder.data };
-        updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata', { keepLocalTime: true }).toISO();
+        // Preserve the exact snooze instant while serialising with IST offset.
+        // keepLocalTime=false (default) avoids shifting the reminder backward.
+        updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata').toISO();
         updatedReminder.triggered = false;
         await storedReminder.message.edit(JSON.stringify(updatedReminder));
         scheduleReminder(updatedReminder);
         const snoozeDescription = describeSnoozeDuration(snoozeTimeMs);
         const snoozedUntilUnix = Math.floor(newDate.getTime() / 1000);
-        await interaction.update({ content: `<@${interaction.user.id}> Reminder snoozed until <t:${snoozedUntilUnix}:F> (${snoozeDescription}).`, components: [] });
+        await interaction.editReply({ content: `<@${interaction.user.id}> Reminder snoozed until <t:${snoozedUntilUnix}:F> (${snoozeDescription}).`, components: [] });
       } catch (err) {
         console.error('Error handling snooze button:', err);
         try {
-          await interaction.reply({ content: 'An error occurred while snoozing your reminder. Please try again later.', ephemeral: true });
+          if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ content: 'An error occurred while snoozing your reminder. Please try again later.', components: [] });
+          } else {
+            await interaction.reply({ content: 'An error occurred while snoozing your reminder. Please try again later.', ephemeral: true });
+          }
         } catch (replyErr) {
           console.error('Error sending snooze error reply:', replyErr);
         }
@@ -813,26 +826,31 @@ client.on('interactionCreate', async interaction => {
     } else if (customId.startsWith('cancel_')) {
       const reminderId = customId.slice('cancel_'.length);
       try {
+        await interaction.deferUpdate();
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (!storageChannel || !storageChannel.isTextBased()) {
-          await interaction.reply({ content: 'Storage channel not available.', ephemeral: true });
+          await interaction.editReply({ content: 'Storage channel not available.', components: [] });
           return;
         }
 
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
         if (!storedReminder) {
-          await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to cancel it.', ephemeral: true });
+          await interaction.editReply({ content: 'This reminder no longer exists or you are not authorized to cancel it.', components: [] });
           return;
         }
 
         cancelScheduledJob(reminderId);
         await storedReminder.message.delete();
 
-        await interaction.update({ content: `<@${interaction.user.id}> Reminder cancelled.`, components: [] });
+        await interaction.editReply({ content: `<@${interaction.user.id}> Reminder cancelled.`, components: [] });
       } catch (err) {
         console.error('Error handling cancel button:', err);
         try {
-          await interaction.reply({ content: 'An error occurred while cancelling your reminder. Please try again later.', ephemeral: true });
+          if (interaction.deferred || interaction.replied) {
+            await interaction.editReply({ content: 'An error occurred while cancelling your reminder. Please try again later.', components: [] });
+          } else {
+            await interaction.reply({ content: 'An error occurred while cancelling your reminder. Please try again later.', ephemeral: true });
+          }
         } catch (replyErr) {
           console.error('Error sending cancel error reply:', replyErr);
         }
