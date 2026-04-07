@@ -92,6 +92,7 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
   }
 
   const { storageMessageId, maxPages = MAX_LOOKUP_PAGES } = options;
+  const pageLimit = Number.isFinite(maxPages) && maxPages > 0 ? maxPages : Infinity;
 
   // Fast path for new reminders: directly fetch by the known storage message id.
   const byMessageId = await fetchStoredReminderByMessageId(
@@ -107,7 +108,7 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
   // Fallback for old reminders that don't have storageMessageId persisted yet.
   let before;
   let pagesFetched = 0;
-  while (pagesFetched < maxPages) {
+  while (pagesFetched < pageLimit) {
     const messages = await storageChannel.messages.fetch({ limit: STORAGE_FETCH_PAGE_SIZE, before });
     if (messages.size === 0) {
       break;
@@ -131,8 +132,8 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
     }
   }
 
-  if (pagesFetched >= maxPages) {
-    console.warn(`Stopped reminder lookup for ${reminderId} after ${maxPages} pages.`);
+  if (Number.isFinite(pageLimit) && pagesFetched >= pageLimit) {
+    console.warn(`Stopped reminder lookup for ${reminderId} after ${pageLimit} pages.`);
   }
 
   return null;
@@ -754,7 +755,7 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'Storage channel not available. Cannot delete reminder.', ephemeral: true });
           return;
         }
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
         if (!storedReminder) {
           await interaction.reply({ content: `No reminder found with ID \`${reminderId}\` for you.`, ephemeral: true });
           return;
@@ -788,14 +789,16 @@ client.on('interactionCreate', async interaction => {
           await interaction.reply({ content: 'Storage channel not available.', ephemeral: true });
           return;
         }
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
         if (!storedReminder) {
           await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', ephemeral: true });
           return;
         }
         const newDate = new Date(Date.now() + snoozeTimeMs);
         const updatedReminder = { ...storedReminder.data };
-        updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata', { keepLocalTime: true }).toISO();
+        // Preserve the exact snooze instant while serialising with IST offset.
+        // keepLocalTime=false (default) avoids shifting the reminder backward.
+        updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata').toISO();
         updatedReminder.triggered = false;
         await storedReminder.message.edit(JSON.stringify(updatedReminder));
         scheduleReminder(updatedReminder);
@@ -819,7 +822,7 @@ client.on('interactionCreate', async interaction => {
           return;
         }
 
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id);
+        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
         if (!storedReminder) {
           await interaction.reply({ content: 'This reminder no longer exists or you are not authorized to cancel it.', ephemeral: true });
           return;
