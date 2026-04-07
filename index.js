@@ -12,6 +12,7 @@ const {
 const schedule = require('node-schedule');
 const chrono = require('chrono-node');
 const { DateTime } = require('luxon');
+const { normalizeLookupPageLimit } = require('./lookupPagination');
 require('dotenv').config();
 
 // Global map to store scheduled jobs (key: reminder id, value: job object)
@@ -92,7 +93,8 @@ async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUs
   }
 
   const { storageMessageId, maxPages = MAX_LOOKUP_PAGES } = options;
-  const pageLimit = Number.isFinite(maxPages) && maxPages > 0 ? maxPages : Infinity;
+  // Preserve explicit caps like 0/NaN as "no paginated fallback" instead of unbounded scan.
+  const pageLimit = normalizeLookupPageLimit(maxPages, MAX_LOOKUP_PAGES);
 
   // Fast path for new reminders: directly fetch by the known storage message id.
   const byMessageId = await fetchStoredReminderByMessageId(
