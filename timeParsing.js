@@ -1,7 +1,20 @@
+// timeParsing.js
+//
+// Natural-language time parsing for reminders, extracted so it can be unit
+// tested without a live Discord connection.
+//
+// All reminders are interpreted in a single fixed timezone (IST / Asia/Kolkata).
+// Crucially, the parse is anchored to that zone regardless of the timezone the
+// *host process* runs in: we hand chrono-node an explicit reference `timezone`
+// (the IST UTC offset in minutes) so that "now" — and therefore forwardDate and
+// past/future decisions — are evaluated against IST wall-clock time, not the
+// server's local clock (which is UTC on most hosts).
 const chrono = require('chrono-node');
 const { DateTime } = require('luxon');
 
-// --- Natural language parsing helpers ---
+// The single timezone in which reminders are interpreted and fired.
+const REMINDER_ZONE = 'Asia/Kolkata';
+
 /**
  * Normalize user provided natural language so that chrono-node can parse a wider
  * variety of casual phrases. This function purposely keeps the text friendly while
@@ -138,13 +151,18 @@ function normalizeTimeInput(rawInput) {
 }
 
 /**
- * Parse the normalized text using chrono-node, taking into account the user's
+ * Parse the normalized text using chrono-node, taking into account the reminder
  * timezone (IST) and adding reasonable defaults if the user omitted any part of
  * the time (for example "next monday" keeps the current time-of-day).
  *
+ * The returned DateTime is guaranteed to be in the future relative to `baseIST`:
+ * chrono's `forwardDate` handles most cases, and when the time-of-day defaulting
+ * lands us back in the past we advance to the next matching occurrence — a full
+ * week for weekday phrases ("monday"), otherwise the next day.
+ *
  * @param {string} timeInputRaw - Raw input from the slash command.
- * @param {DateTime} baseIST - Current time in IST, used as reference.
- * @returns {DateTime|null} Parsed DateTime or null if parsing failed.
+ * @param {DateTime} baseIST - Current time in IST, used as reference "now".
+ * @returns {DateTime|null} Parsed DateTime (IST) or null if parsing failed.
  */
 function parseReminderDateTime(timeInputRaw, baseIST) {
   const normalizedInput = normalizeTimeInput(timeInputRaw);
@@ -152,7 +170,17 @@ function parseReminderDateTime(timeInputRaw, baseIST) {
     return null;
   }
 
-  const results = chrono.parse(normalizedInput, baseIST.toJSDate(), { forwardDate: true });
+  // Anchor chrono to IST rather than the host's local clock. Passing the
+  // reference `timezone` (IST offset in minutes, e.g. 330) means chrono treats
+  // "now" as IST wall-clock time and stamps offset-less phrases (e.g. "at 8am")
+  // with the IST offset. Without this, a host running in UTC would consider a
+  // time that is already past in IST to still be in the future, scheduling the
+  // reminder on the wrong day.
+  const results = chrono.parse(
+    normalizedInput,
+    { instant: baseIST.toJSDate(), timezone: baseIST.offset },
+    { forwardDate: true }
+  );
   if (!results || results.length === 0) {
     return null;
   }
@@ -160,22 +188,13 @@ function parseReminderDateTime(timeInputRaw, baseIST) {
   const parsedResult = results[0];
   const parsedDate = parsedResult.date();
   const start = parsedResult.start;
-  if (!parsedDate) {
+  if (!parsedDate || !start) {
     return null;
   }
 
-  if (!start) {
-    return null;
-  }
-
-  // Chrono omits timezone information for most casual phrases ("tomorrow at 5pm"
-  // or "next monday"), which means the Date instance we receive is expressed in
-  // the server's local zone (UTC on the bot host). In those cases we must keep the
-  // clock time intact when moving into IST. For results that *do* carry a concrete
-  // offset (e.g. "in 10 mins", "5pm UTC") we let Luxon shift the instant so that
-  // relative phrases remain accurate.
-  const keepLocalTime = !start.isCertain('timezoneOffset');
-  let dt = DateTime.fromJSDate(parsedDate).setZone('Asia/Kolkata', { keepLocalTime });
+  // Because the parse is anchored to IST, the produced instant already reflects
+  // IST wall-clock time; convert straight into the reminder zone.
+  let dt = DateTime.fromJSDate(parsedDate).setZone(REMINDER_ZONE);
 
   // Use chrono certainty flags to determine whether the user explicitly
   // provided the time components. If not, reuse the current IST time-of-day so
@@ -187,17 +206,23 @@ function parseReminderDateTime(timeInputRaw, baseIST) {
       second: baseIST.second,
       millisecond: baseIST.millisecond
     });
-  } else {
+  } else if (!start.isCertain('minute')) {
     // If the hour was present but minutes/seconds were not, normalise to :00
     // to avoid ambiguous times such as "at 5" (which chrono interprets as 5:00).
-    if (!start.isCertain('minute')) {
-      dt = dt.set({ minute: 0, second: 0, millisecond: 0 });
-    } else if (!start.isCertain('second')) {
-      dt = dt.set({ second: 0, millisecond: 0 });
-    }
+    dt = dt.set({ minute: 0, second: 0, millisecond: 0 });
+  } else if (!start.isCertain('second')) {
+    dt = dt.set({ second: 0, millisecond: 0 });
+  }
+
+  // Defensive forward adjustment: forwardDate keeps chrono's own output in the
+  // future, but reusing the base time-of-day above can push a same-day result
+  // back into the past. Advance to the next sensible occurrence — a full week
+  // when the user named a weekday, otherwise the next day.
+  if (dt <= baseIST) {
+    dt = start.isCertain('weekday') ? dt.plus({ days: 7 }) : dt.plus({ days: 1 });
   }
 
   return dt;
 }
 
-module.exports = { normalizeTimeInput, parseReminderDateTime };
+module.exports = { REMINDER_ZONE, normalizeTimeInput, parseReminderDateTime };

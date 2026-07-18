@@ -260,7 +260,6 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
   }
 })();
 
-
 /**
  * Describe a recurrence pattern in a user friendly manner for acknowledgement
  * messages and logs.
@@ -495,16 +494,14 @@ client.on('interactionCreate', async interaction => {
 
         // Create a base reference in IST and attempt to parse the natural language input.
         const baseIST = DateTime.now().setZone('Asia/Kolkata');
-        let dt = parseReminderDateTime(timeInputRaw, baseIST);
+        const dt = parseReminderDateTime(timeInputRaw, baseIST);
         if (!dt) {
           await interaction.reply({ content: 'Sorry, I could not understand that time. Please try a different format.', ephemeral: true });
           return;
         }
-        // If the resulting time is still before now (in IST), adjust by adding one day
-        // so vague phrases such as "today evening" still occur in the future.
-        if (dt <= baseIST) {
-          dt = dt.plus({ days: 1 });
-        }
+        // parseReminderDateTime already guarantees a future time (advancing to
+        // the next matching occurrence when needed), so no extra bump is applied
+        // here. The check below remains as a final safety net.
 
         const finalISTDate = dt.toJSDate();
         if (finalISTDate <= new Date()) {
