@@ -31,9 +31,11 @@ function normalizeTimeInput(rawInput) {
 
   // Collapse multiple spaces and ensure there is always a space between digits
   // and characters so expressions such as "in10mins" or "feb18" are readable.
+  // Ordinal suffixes ("22nd", "1st") must stay attached to their digits or
+  // chrono-node loses the day-of-month entirely.
   normalized = normalized.replace(/\s+/g, ' ');
   normalized = normalized.replace(/([a-zA-Z])(\d)/g, '$1 $2');
-  normalized = normalized.replace(/(\d)([a-zA-Z])/g, '$1 $2');
+  normalized = normalized.replace(/(\d)(?!(?:st|nd|rd|th)\b)([a-zA-Z])/gi, '$1 $2');
 
   // Helpful replacements for common natural phrases which chrono does not
   // always interpret as expected.

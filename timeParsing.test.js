@@ -106,6 +106,28 @@ describe('parseReminderDateTime — day/date phrases', () => {
   });
 });
 
+// Regression: the digit/letter spacing rule used to mangle "22nd" into "22 nd",
+// so chrono only matched the month and forwardDate pushed a bare "July" to
+// July 1st of NEXT year.
+describe('parseReminderDateTime — ordinal dates', () => {
+  test('"On 22nd July" resolves to the upcoming 22nd, not next year', () => {
+    assert.equal(parseFmt('On 22nd July'), 'Wed 2026-07-22 12:38');
+  });
+
+  test('an ordinal date already past this year rolls to next year ("On 2nd July")', () => {
+    assert.equal(parseFmt('On 2nd July'), 'Fri 2027-07-02 12:38');
+  });
+
+  test('ordinal date with an explicit time keeps the given hour', () => {
+    assert.equal(parseFmt('22nd July at 6pm'), 'Wed 2026-07-22 18:00');
+  });
+
+  test('"1st of August" and "march 3rd" parse as day-of-month', () => {
+    assert.equal(parseFmt('1st of August'), 'Sat 2026-08-01 12:38');
+    assert.equal(parseFmt('march 3rd'), 'Wed 2027-03-03 12:38');
+  });
+});
+
 describe('parseReminderDateTime — normalisation shortcuts', () => {
   test('"tonight" maps to 9pm today', () => {
     assert.equal(parseFmt('tonight'), 'Mon 2026-07-13 21:00');
@@ -147,6 +169,13 @@ describe('normalizeTimeInput', () => {
     assert.equal(normalizeTimeInput('in10mins'), 'in 10 mins');
     assert.equal(normalizeTimeInput('feb18'), 'feb 18');
     assert.equal(normalizeTimeInput('  at   22:45  '), 'at 22:45');
+  });
+
+  test('keeps ordinal suffixes attached to their digits', () => {
+    assert.equal(normalizeTimeInput('On 22nd July'), 'On 22nd July');
+    assert.equal(normalizeTimeInput('1st of August'), '1st of August');
+    assert.equal(normalizeTimeInput('march 3rd'), 'march 3rd');
+    assert.equal(normalizeTimeInput('the 4th at 5pm'), 'the 4th at 5 pm');
   });
 
   test('maps vague phrases to concrete times', () => {
