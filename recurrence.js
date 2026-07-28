@@ -1,6 +1,9 @@
 const { DateTime } = require('luxon');
+const { REMINDER_ZONE } = require('./timeParsing');
 
-const IST = 'Asia/Kolkata';
+// Re-exported under the local name used throughout this module. The zone itself
+// is owned by timeParsing so parsing and recurrence can never disagree.
+const IST = REMINDER_ZONE;
 
 // Upper bound on catch-up steps when replaying a stale schedule forward, so a
 // long outage (or an unsatisfiable pattern) can never spin forever.
