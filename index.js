@@ -13,6 +13,7 @@ const schedule = require('node-schedule');
 const { DateTime } = require('luxon');
 const { normalizeLookupPageLimit } = require('./lookupPagination');
 const { parseReminderDateTime } = require('./timeParsing');
+const { computeNextRecurrence, resolveRecurrenceFloor } = require('./recurrence');
 require('dotenv').config();
 
 // Global map to store scheduled jobs (key: reminder id, value: job object)
@@ -286,46 +287,6 @@ function describeRecurrence(recurrenceType) {
   }
 }
 
-/**
- * Compute the next DateTime (in IST) for a given recurrence pattern.
- *
- * @param {DateTime} currentIST - The current scheduled DateTime in IST.
- * @param {string} recurrenceType - Recurrence identifier.
- * @returns {DateTime|null} The next scheduled time or null when not possible.
- */
-function getNextRecurrenceDateTime(currentIST, recurrenceType) {
-  if (!currentIST || !currentIST.isValid) {
-    return null;
-  }
-
-  switch (recurrenceType) {
-    case 'hourly':
-      return currentIST.plus({ hours: 1 });
-    case 'daily':
-      return currentIST.plus({ days: 1 });
-    case 'weekday': {
-      let next = currentIST.plus({ days: 1 });
-      let guard = 0;
-      while (next.weekday > 5) {
-        next = next.plus({ days: 1 });
-        guard += 1;
-        if (guard > 7) {
-          return null;
-        }
-      }
-      return next;
-    }
-    case 'weekly':
-      return currentIST.plus({ weeks: 1 });
-    case 'monthly':
-      return currentIST.plus({ months: 1 });
-    case 'yearly':
-      return currentIST.plus({ years: 1 });
-    default:
-      return null;
-  }
-}
-
 // --- Helper: Schedule a Reminder ---
 // Reminder object: { id, userId, channelId, remindAt (ISO string), title (optional) }
 function scheduleReminder(reminder) {
@@ -400,20 +361,20 @@ function scheduleReminder(reminder) {
 
             const recurrenceType = currentData?.recurrence?.type;
             if (recurrenceType) {
-              let nextIST = DateTime.fromISO(reminder.remindAt).setZone('Asia/Kolkata');
-              let iterations = 0;
+              // Advance from the recurrence anchor, not the fired remindAt, so a
+              // snoozed occurrence does not drag the schedule forward. Fall back
+              // to remindAt for records created before anchors were tracked.
+              const anchorISO = currentData.recurrence.anchor || reminder.remindAt;
               const nowIST = DateTime.now().setZone('Asia/Kolkata');
+              // Guarantee forward progress even if the job fires a few ms early:
+              // the next occurrence must clear both now and the instant that just
+              // fired, otherwise we could reschedule a time already in the past.
+              const afterIST = resolveRecurrenceFloor(reminder.remindAt, nowIST);
+              const nextIST = computeNextRecurrence(anchorISO, recurrenceType, afterIST);
 
-              do {
-                nextIST = getNextRecurrenceDateTime(nextIST, recurrenceType);
-                iterations += 1;
-                if (!nextIST) {
-                  break;
-                }
-              } while (nextIST <= nowIST && iterations < 400);
-
-              if (nextIST && iterations < 400) {
+              if (nextIST) {
                 currentData.remindAt = nextIST.toISO();
+                currentData.recurrence.anchor = nextIST.toISO();
                 currentData.triggered = false;
                 await storedReminder.message.edit(JSON.stringify(currentData));
                 scheduleReminder(currentData);
@@ -454,20 +415,16 @@ client.once('ready', async () => {
         if (remindAt > new Date()) {
           scheduleReminder(data);
         } else if (data?.recurrence?.type) {
-          let nextIST = DateTime.fromISO(data.remindAt).setZone('Asia/Kolkata');
+          // Missed while offline: catch the schedule up from the anchor so the
+          // canonical time of day is preserved. Fall back to remindAt for
+          // records created before anchors were tracked.
+          const anchorISO = data.recurrence.anchor || data.remindAt;
           const nowIST = DateTime.now().setZone('Asia/Kolkata');
-          let iterations = 0;
+          const nextIST = computeNextRecurrence(anchorISO, data.recurrence.type, nowIST);
 
-          do {
-            nextIST = getNextRecurrenceDateTime(nextIST, data.recurrence.type);
-            iterations += 1;
-            if (!nextIST) {
-              break;
-            }
-          } while (nextIST <= nowIST && iterations < 400);
-
-          if (nextIST && iterations < 400) {
+          if (nextIST) {
             data.remindAt = nextIST.toISO();
+            data.recurrence.anchor = nextIST.toISO();
             message.edit(JSON.stringify(data)).catch(console.error);
             scheduleReminder(data);
           } else {
@@ -518,7 +475,9 @@ client.on('interactionCreate', async interaction => {
           // Store the reminder time as the ISO string with the IST offset.
           remindAt: dt.toISO(),
           title: title || null,
-          recurrence: repeat ? { type: repeat } : null,
+          // `anchor` records the canonical recurrence time so that snoozing an
+          // occurrence never shifts the underlying schedule.
+          recurrence: repeat ? { type: repeat, anchor: dt.toISO() } : null,
           triggered: false
         };
 
