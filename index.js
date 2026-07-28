@@ -11,8 +11,15 @@ const {
 } = require('discord.js');
 const schedule = require('node-schedule');
 const { DateTime } = require('luxon');
-const { normalizeLookupPageLimit } = require('./lookupPagination');
 const { parseReminderDateTime } = require('./timeParsing');
+const {
+  fetchStoredReminderMessage,
+  forEachStoredReminder,
+  backfillStorageMessageId,
+  applyRecurrenceRollover,
+  applySnooze,
+  applyStartupCatchUp
+} = require('./reminderStorage');
 require('dotenv').config();
 
 // Global map to store scheduled jobs (key: reminder id, value: job object)
@@ -30,158 +37,6 @@ function cancelScheduledJob(reminderId) {
     existingJob.cancel();
   }
   scheduledJobs.delete(reminderId);
-}
-
-/**
- * Locate the backing storage message for a reminder.
- *
- * @param {import('discord.js').TextBasedChannel} storageChannel - Channel that stores reminders.
- * @param {string} reminderId - The reminder identifier to look up.
- * @param {string} [expectedUserId] - Optional user ID to enforce ownership.
- * @returns {Promise<{ message: import('discord.js').Message, data: object } | null>}
- */
-const STORAGE_FETCH_PAGE_SIZE = 100;
-const MAX_LOOKUP_PAGES = Number.parseInt(process.env.REMINDER_LOOKUP_MAX_PAGES || '50', 10);
-const MAX_STARTUP_SCAN_PAGES = Number.parseInt(process.env.REMINDER_STARTUP_SCAN_MAX_PAGES || '100', 10);
-
-/**
- * Parse JSON payloads from storage messages and return null on invalid payloads.
- *
- * @param {import('discord.js').Message} message
- * @returns {object|null}
- */
-function parseStoredReminderData(message) {
-  try {
-    return JSON.parse(message.content);
-  } catch (err) {
-    return null;
-  }
-}
-
-/**
- * Fetch a storage message by id, parse it and optionally assert owner/reminder id.
- *
- * @param {import('discord.js').TextBasedChannel} storageChannel
- * @param {string} messageId
- * @param {string} reminderId
- * @param {string} [expectedUserId]
- * @returns {Promise<{ message: import('discord.js').Message, data: object } | null>}
- */
-async function fetchStoredReminderByMessageId(storageChannel, messageId, reminderId, expectedUserId) {
-  if (!messageId) {
-    return null;
-  }
-
-  try {
-    const message = await storageChannel.messages.fetch(messageId);
-    const data = parseStoredReminderData(message);
-    if (!data || data.id !== reminderId) {
-      return null;
-    }
-    if (expectedUserId && data.userId !== expectedUserId) {
-      return null;
-    }
-    return { message, data };
-  } catch (err) {
-    return null;
-  }
-}
-
-async function fetchStoredReminderMessage(storageChannel, reminderId, expectedUserId, options = {}) {
-  if (!storageChannel || !storageChannel.isTextBased()) {
-    return null;
-  }
-
-  const { storageMessageId, maxPages = MAX_LOOKUP_PAGES } = options;
-  // Preserve explicit caps like 0/NaN as "no paginated fallback" instead of unbounded scan.
-  const pageLimit = normalizeLookupPageLimit(maxPages, MAX_LOOKUP_PAGES);
-
-  // Fast path for new reminders: directly fetch by the known storage message id.
-  const byMessageId = await fetchStoredReminderByMessageId(
-    storageChannel,
-    storageMessageId,
-    reminderId,
-    expectedUserId
-  );
-  if (byMessageId) {
-    return byMessageId;
-  }
-
-  // Fallback for old reminders that don't have storageMessageId persisted yet.
-  let before;
-  let pagesFetched = 0;
-  while (pagesFetched < pageLimit) {
-    const messages = await storageChannel.messages.fetch({ limit: STORAGE_FETCH_PAGE_SIZE, before });
-    if (messages.size === 0) {
-      break;
-    }
-
-    for (const message of messages.values()) {
-      const data = parseStoredReminderData(message);
-      if (!data) {
-        continue;
-      }
-
-      if (data.id === reminderId && (!expectedUserId || data.userId === expectedUserId)) {
-        return { message, data };
-      }
-    }
-
-    pagesFetched += 1;
-    before = messages.last()?.id;
-    if (!before || messages.size < STORAGE_FETCH_PAGE_SIZE) {
-      break;
-    }
-  }
-
-  if (Number.isFinite(pageLimit) && pagesFetched >= pageLimit) {
-    console.warn(`Stopped reminder lookup for ${reminderId} after ${pageLimit} pages.`);
-  }
-
-  return null;
-}
-
-/**
- * Iterate through JSON reminder payloads stored in the storage channel.
- * The scan is paginated and capped to protect startup from excessive history.
- *
- * @param {import('discord.js').TextBasedChannel} storageChannel
- * @param {(message: import('discord.js').Message, data: object) => Promise<void>} visitor
- * @param {{ maxPages?: number }} [options]
- * @returns {Promise<void>}
- */
-async function forEachStoredReminder(storageChannel, visitor, options = {}) {
-  if (!storageChannel || !storageChannel.isTextBased()) {
-    return;
-  }
-
-  const { maxPages = MAX_STARTUP_SCAN_PAGES } = options;
-
-  let before;
-  let pagesFetched = 0;
-  while (pagesFetched < maxPages) {
-    const messages = await storageChannel.messages.fetch({ limit: STORAGE_FETCH_PAGE_SIZE, before });
-    if (messages.size === 0) {
-      return;
-    }
-
-    for (const message of messages.values()) {
-      const data = parseStoredReminderData(message);
-      if (!data) {
-        continue;
-      }
-
-      await visitor(message, data);
-    }
-
-    pagesFetched += 1;
-    before = messages.last()?.id;
-    if (!before || messages.size < STORAGE_FETCH_PAGE_SIZE) {
-      return;
-    }
-  }
-
-  console.warn(`Stopped startup reminder scan after ${maxPages} pages.`);
 }
 
 /**
@@ -286,46 +141,6 @@ function describeRecurrence(recurrenceType) {
   }
 }
 
-/**
- * Compute the next DateTime (in IST) for a given recurrence pattern.
- *
- * @param {DateTime} currentIST - The current scheduled DateTime in IST.
- * @param {string} recurrenceType - Recurrence identifier.
- * @returns {DateTime|null} The next scheduled time or null when not possible.
- */
-function getNextRecurrenceDateTime(currentIST, recurrenceType) {
-  if (!currentIST || !currentIST.isValid) {
-    return null;
-  }
-
-  switch (recurrenceType) {
-    case 'hourly':
-      return currentIST.plus({ hours: 1 });
-    case 'daily':
-      return currentIST.plus({ days: 1 });
-    case 'weekday': {
-      let next = currentIST.plus({ days: 1 });
-      let guard = 0;
-      while (next.weekday > 5) {
-        next = next.plus({ days: 1 });
-        guard += 1;
-        if (guard > 7) {
-          return null;
-        }
-      }
-      return next;
-    }
-    case 'weekly':
-      return currentIST.plus({ weeks: 1 });
-    case 'monthly':
-      return currentIST.plus({ months: 1 });
-    case 'yearly':
-      return currentIST.plus({ years: 1 });
-    default:
-      return null;
-  }
-}
-
 // --- Helper: Schedule a Reminder ---
 // Reminder object: { id, userId, channelId, remindAt (ISO string), title (optional) }
 function scheduleReminder(reminder) {
@@ -390,40 +205,17 @@ function scheduleReminder(reminder) {
         if (storageChannel && storageChannel.isTextBased()) {
           const storedReminder = await fetchStoredReminderMessage(storageChannel, reminder.id, undefined, { storageMessageId: reminder.storageMessageId });
           if (storedReminder) {
-            const currentData = storedReminder.data;
-
             // Persist storage message id when absent so future lookups are O(1).
-            if (!currentData.storageMessageId) {
-              currentData.storageMessageId = storedReminder.message.id;
-              await storedReminder.message.edit(JSON.stringify(currentData));
-            }
+            await backfillStorageMessageId(storedReminder);
 
-            const recurrenceType = currentData?.recurrence?.type;
-            if (recurrenceType) {
-              let nextIST = DateTime.fromISO(reminder.remindAt).setZone('Asia/Kolkata');
-              let iterations = 0;
-              const nowIST = DateTime.now().setZone('Asia/Kolkata');
-
-              do {
-                nextIST = getNextRecurrenceDateTime(nextIST, recurrenceType);
-                iterations += 1;
-                if (!nextIST) {
-                  break;
-                }
-              } while (nextIST <= nowIST && iterations < 400);
-
-              if (nextIST && iterations < 400) {
-                currentData.remindAt = nextIST.toISO();
-                currentData.triggered = false;
-                await storedReminder.message.edit(JSON.stringify(currentData));
-                scheduleReminder(currentData);
-              } else {
-                currentData.triggered = true;
-                await storedReminder.message.edit(JSON.stringify(currentData));
-              }
-            } else {
-              currentData.triggered = true;
-              await storedReminder.message.edit(JSON.stringify(currentData));
+            // Rolls the record forward from its recurrence anchor (not the fired
+            // remindAt), so a snoozed occurrence cannot drag the series off slot.
+            const { rescheduled, data: currentData } = await applyRecurrenceRollover(
+              storedReminder,
+              reminder.remindAt
+            );
+            if (rescheduled) {
+              scheduleReminder(currentData);
             }
           } else {
             // If the backing record was deleted, do not reschedule the reminder.
@@ -453,30 +245,20 @@ client.once('ready', async () => {
         const remindAt = new Date(data.remindAt);
         if (remindAt > new Date()) {
           scheduleReminder(data);
-        } else if (data?.recurrence?.type) {
-          let nextIST = DateTime.fromISO(data.remindAt).setZone('Asia/Kolkata');
-          const nowIST = DateTime.now().setZone('Asia/Kolkata');
-          let iterations = 0;
-
-          do {
-            nextIST = getNextRecurrenceDateTime(nextIST, data.recurrence.type);
-            iterations += 1;
-            if (!nextIST) {
-              break;
-            }
-          } while (nextIST <= nowIST && iterations < 400);
-
-          if (nextIST && iterations < 400) {
-            data.remindAt = nextIST.toISO();
-            message.edit(JSON.stringify(data)).catch(console.error);
-            scheduleReminder(data);
-          } else {
-            message.delete().catch(console.error);
-          }
-        } else {
-          message.delete().catch(console.error);
+          return;
         }
 
+        // Missed while offline: catch the schedule up from the anchor so the
+        // canonical time of day survives the outage. One bad record must not
+        // abort the remaining scan, so failures are logged and skipped.
+        try {
+          const { action } = await applyStartupCatchUp(message, data);
+          if (action === 'rescheduled') {
+            scheduleReminder(data);
+          }
+        } catch (err) {
+          console.error(`Error catching up reminder ${data.id}:`, err);
+        }
     });
   } catch (err) {
     console.error('Error fetching reminders from storage channel:', err);
@@ -518,7 +300,9 @@ client.on('interactionCreate', async interaction => {
           // Store the reminder time as the ISO string with the IST offset.
           remindAt: dt.toISO(),
           title: title || null,
-          recurrence: repeat ? { type: repeat } : null,
+          // `anchor` records the canonical recurrence time so that snoozing an
+          // occurrence never shifts the underlying schedule.
+          recurrence: repeat ? { type: repeat, anchor: dt.toISO() } : null,
           triggered: false
         };
 
@@ -604,12 +388,9 @@ client.on('interactionCreate', async interaction => {
           return;
         }
         const newDate = new Date(Date.now() + snoozeTimeMs);
-        const updatedReminder = { ...storedReminder.data };
-        // Preserve the exact snooze instant while serialising with IST offset.
-        // keepLocalTime=false (default) avoids shifting the reminder backward.
-        updatedReminder.remindAt = DateTime.fromJSDate(newDate).setZone('Asia/Kolkata').toISO();
-        updatedReminder.triggered = false;
-        await storedReminder.message.edit(JSON.stringify(updatedReminder));
+        // Moves only this occurrence: the recurrence anchor is deliberately left
+        // untouched so the series keeps its canonical slot afterwards.
+        const updatedReminder = await applySnooze(storedReminder, newDate);
         scheduleReminder(updatedReminder);
         const snoozeDescription = describeSnoozeDuration(snoozeTimeMs);
         const snoozedUntilUnix = Math.floor(newDate.getTime() / 1000);
