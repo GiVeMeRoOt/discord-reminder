@@ -127,6 +127,12 @@ Run it as a **worker** process (there is no web server).
 | [`index.js`](index.js) | Bot entry point: command registration, scheduling, persistence, and interaction handling. |
 | [`timeParsing.js`](timeParsing.js) | Natural-language time parsing (IST-anchored, host-timezone independent). |
 | [`timeParsing.test.js`](timeParsing.test.js) | Aggressive tests for the parser, including host-timezone independence. |
+| [`recurrence.js`](recurrence.js) | Recurrence arithmetic: next-occurrence resolution and outage catch-up. |
+| [`recurrence.test.js`](recurrence.test.js) | Tests for recurrence, including bulk-vs-stepped catch-up parity. |
+| [`reminderStorage.js`](reminderStorage.js) | Reads and writes reminder records in the storage channel, and decides who may act on one. |
+| [`reminderStorage.test.js`](reminderStorage.test.js) | Tests for lookup, ownership, snooze, rollover, and startup catch-up. |
+| [`interactionReplies.js`](interactionReplies.js) | Replies for a button press whose reminder is gone or is not the presser's. |
+| [`interactionReplies.test.js`](interactionReplies.test.js) | Tests that a dead button never overwrites the public reminder text. |
 | [`lookupPagination.js`](lookupPagination.js) | Helper that normalizes reminder-lookup page limits (preserves explicit "no fallback" caps). |
 | [`lookupPagination.test.js`](lookupPagination.test.js) | Tests for the pagination helper. |
 | [`.env.example`](.env.example) | Template for required environment variables. |
@@ -141,7 +147,28 @@ npm test        # or: node --test
 ## Known issues
 
 - **Timezone is hard-coded to IST (`Asia/Kolkata`).** Reminders are always parsed and
-  fired in IST regardless of the user's actual timezone.
+  fired in IST regardless of the user's actual timezone. The recurrence catch-up in
+  [`recurrence.js`](recurrence.js) also assumes that zone is fixed-offset.
+
+- **Monthly recurrence drifts off month ends.** A monthly reminder is advanced one
+  month at a time, and `plus({ months: 1 })` clamps to the shortest month it crosses,
+  so the day-of-month ratchets permanently downward: "monthly on the 31st" becomes the
+  28th and stays there. Fixing it means storing the intended day-of-month and clamping
+  per occurrence rather than accumulating the clamp. `yearly` has the same defect for a
+  Feb 29 anchor.
+
+- **A press on a stale button costs a full storage-channel scan.** Button custom ids
+  carry only the reminder id, so the single-fetch fast path in
+  [`reminderStorage.js`](reminderStorage.js) cannot be used and the lookup falls back to
+  walking the channel 100 messages at a time. A recurring reminder leaves one
+  button-bearing message per occurrence and only the pressed one gets its buttons
+  retired, so the other messages stay clickable. Carrying the storage message id in the
+  custom id would fix this, and needs a parser that still accepts ids already posted.
+
+- **An unresolvable recurrence record is deleted, not quarantined.** When catch-up
+  cannot produce a next occurrence, the startup scan deletes the record. In a
+  channel-as-database design that is unrecoverable. Reachable only with an anchor
+  decades stale or outside Luxon's range, which no normal flow produces.
 
 > **Fixed:** weekday phrasing on a non‑IST host used to land on the wrong day — e.g. on a
 > UTC host, `/rme time:at 8 AM on Monday` sent on a Monday afternoon scheduled for Tuesday.
