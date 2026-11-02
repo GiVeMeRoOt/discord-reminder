@@ -49,6 +49,70 @@ function getNextRecurrenceDateTime(currentIST, recurrenceType) {
   }
 }
 
+// Patterns whose period is a fixed calendar step, so whole periods can be
+// skipped in a single jump.
+//
+// Monthly and yearly are deliberately absent, because `plus({ months: n })`
+// clamps month ends differently from n single steps, so bulk-jumping them would
+// change existing schedules. They stay single-stepped, which bounds them by
+// MAX_CATCHUP_ITERATIONS: roughly 33 years of anchor age for monthly and 400 for
+// yearly. That is anchor age, not outage length -- `/rme` rejects past times and
+// every rollover rewrites the anchor, so no normal flow gets near it.
+//
+// `weekday` maps to whole weeks, which is only equivalent to stepping because the
+// cadence is EVERY weekday: a jump landing mid-weekend re-converges on the next
+// Monday, which is in the occurrence set anyway. A cadence like "every other
+// weekday" would break silently here.
+//
+// All of this also assumes REMINDER_ZONE is fixed-offset (see bulkAdvance).
+const BULK_ADVANCE_UNIT = {
+  hourly: 'hours',
+  daily: 'days',
+  weekly: 'weeks',
+  // Whole weeks preserve the weekday and hour; the step loop finishes the job.
+  weekday: 'weeks'
+};
+
+/**
+ * Skip whole periods in one jump, so catch-up cost does not scale with the
+ * length of an outage.
+ *
+ * An hourly reminder stepped an hour at a time needs 400 steps to cross 17 days,
+ * which exhausted the iteration guard and reported the series as unsatisfiable,
+ * which in turn had the startup scan delete the record. The last period is left
+ * to the caller's step loop: that keeps weekend skipping exact and guarantees the
+ * result is still at or before `afterIST`.
+ *
+ * @param {DateTime} fromIST - Current candidate occurrence.
+ * @param {DateTime} afterIST - The occurrence must end up strictly after this.
+ * @param {string} recurrenceType - Recurrence identifier.
+ * @returns {DateTime} `fromIST`, or a later occurrence still at or before `afterIST`.
+ */
+function bulkAdvance(fromIST, afterIST, recurrenceType) {
+  const unit = BULK_ADVANCE_UNIT[recurrenceType];
+  if (!unit) {
+    return fromIST;
+  }
+  // Returns a sentinel rather than throwing, matching the rest of this module.
+  // An invalid DateTime makes the diff NaN, and `NaN <= 0` is false, so without
+  // this the arithmetic below would reach `plus({ unit: NaN })` and throw.
+  if (!fromIST || !fromIST.isValid || !afterIST || !afterIST.isValid) {
+    return fromIST;
+  }
+
+  const periods = Math.floor(afterIST.diff(fromIST, unit).as(unit)) - 1;
+  if (!Number.isFinite(periods) || periods <= 0) {
+    return fromIST;
+  }
+
+  // `periods` is floor(diff) - 1, so the jump cannot overshoot `afterIST` for a
+  // fixed-offset zone. The check is kept as a cheap backstop in case
+  // REMINDER_ZONE ever moves to a zone with DST, where a whole-unit jump and a
+  // whole-unit diff can disagree by an hour.
+  const jumped = fromIST.plus({ [unit]: periods });
+  return jumped.isValid && jumped <= afterIST ? jumped : fromIST;
+}
+
 /**
  * Resolve the next occurrence of a recurring reminder from its anchor.
  *
@@ -72,16 +136,22 @@ function computeNextRecurrence(anchorISO, recurrenceType, afterIST) {
     return null;
   }
 
+  // Unconditional: bulkAdvance already no-ops when fewer than two whole periods
+  // separate the anchor from the floor.
+  nextIST = bulkAdvance(nextIST, afterIST, recurrenceType);
+
   let iterations = 0;
   while (nextIST <= afterIST) {
+    // Checked before stepping: the guard must not discard an occurrence that the
+    // final step has already carried past the floor.
+    if (iterations >= MAX_CATCHUP_ITERATIONS) {
+      return null;
+    }
     nextIST = getNextRecurrenceDateTime(nextIST, recurrenceType);
     if (!nextIST) {
       return null;
     }
     iterations += 1;
-    if (iterations >= MAX_CATCHUP_ITERATIONS) {
-      return null;
-    }
   }
   return nextIST;
 }
@@ -107,6 +177,7 @@ module.exports = {
   IST,
   MAX_CATCHUP_ITERATIONS,
   getNextRecurrenceDateTime,
+  bulkAdvance,
   computeNextRecurrence,
   resolveRecurrenceFloor
 };

@@ -3,6 +3,9 @@ const assert = require('node:assert');
 const { DateTime } = require('luxon');
 const {
   IST,
+  MAX_CATCHUP_ITERATIONS,
+  bulkAdvance,
+  getNextRecurrenceDateTime,
   computeNextRecurrence,
   resolveRecurrenceFloor
 } = require('./recurrence');
@@ -128,8 +131,187 @@ test('unknown recurrence types and invalid anchors yield null', () => {
   assert.strictEqual(computeNextRecurrence('not-a-date', 'daily', at(27, 8)), null);
 });
 
-test('bounded catch-up: hourly cannot replay across an absurd gap', () => {
-  // >400 hourly steps must bail out rather than loop.
+test('hourly catch-up survives a long outage instead of being dropped', () => {
+  // 60 days is 1440 single hourly steps, far past MAX_CATCHUP_ITERATIONS. Whole
+  // periods are skipped in one jump, so the series keeps its minute slot rather
+  // than resolving to null and having the startup scan delete the record.
   const anchor = at(27, 8).minus({ days: 60 });
-  assert.strictEqual(computeNextRecurrence(anchor.toISO(), 'hourly', at(27, 8)), null);
+
+  const next = computeNextRecurrence(anchor.toISO(), 'hourly', at(27, 8));
+
+  assert.ok(next, 'an hourly series must not be reported as unsatisfiable');
+  assert.strictEqual(next.toISO(), at(27, 9).toISO());
+  assert.strictEqual(next.minute, 0, 'minute slot must not drift');
+});
+
+test('bulk catch-up lands exactly where stepping would, month ends included', () => {
+  // The real parity check: step a reference occurrence one period at a time with
+  // no jump, then assert the bulk path agrees. Month-end and leap-day anchors are
+  // included because that is where whole-unit arithmetic and repeated single
+  // steps are most likely to disagree.
+  const anchors = [
+    at(27, 9, 15),  // Monday
+    at(25, 9, 15),  // Saturday, so weekday cadence starts off-set
+    DateTime.fromObject({ year: 2026, month: 1, day: 31, hour: 9, minute: 15 }, { zone: IST }),
+    DateTime.fromObject({ year: 2028, month: 2, day: 29, hour: 9, minute: 15 }, { zone: IST })
+  ];
+
+  for (const anchor of anchors) {
+    for (const [type, gap] of [
+      ['hourly', { days: 45 }],
+      ['daily', { days: 500 }],
+      ['weekly', { weeks: 30 }],
+      ['weekday', { days: 90 }]
+    ]) {
+      const afterIST = anchor.plus(gap);
+
+      let stepped = anchor;
+      while (stepped <= afterIST) {
+        stepped = getNextRecurrenceDateTime(stepped, type);
+      }
+
+      const next = computeNextRecurrence(anchor.toISO(), type, afterIST);
+
+      assert.ok(next, `${type} must resolve from ${anchor.toISODate()}`);
+      assert.strictEqual(
+        next.toISO(),
+        stepped.toISO(),
+        `${type} bulk jump diverged from stepping at ${anchor.toISODate()}`
+      );
+      assert.strictEqual(next.minute, 15, `${type} minute slot drifted`);
+      if (type === 'weekday') {
+        assert.ok(next.weekday <= 5, 'weekday cadence must not land on a weekend');
+      }
+    }
+  }
+});
+
+test('bulkAdvance returns a sentinel instead of throwing on invalid input', () => {
+  // Every other entry point in this module guards its input and returns a
+  // sentinel; a NaN diff must not reach plus({ unit: NaN }), which throws.
+  const invalid = DateTime.invalid('deliberately invalid');
+  const valid = at(27, 8);
+
+  assert.strictEqual(bulkAdvance(valid, invalid, 'hourly').toISO(), valid.toISO());
+  assert.strictEqual(bulkAdvance(invalid, valid, 'hourly').isValid, false);
+  assert.strictEqual(bulkAdvance(valid, undefined, 'daily').toISO(), valid.toISO());
+});
+
+test('the iteration guard does not discard a just-resolved occurrence', () => {
+  // Monthly is stepped one month at a time on purpose, so a gap needing exactly
+  // MAX_CATCHUP_ITERATIONS steps used to return null despite having an answer.
+  const anchor = at(27, 8);
+  const afterIST = anchor.plus({ months: MAX_CATCHUP_ITERATIONS - 1 }).plus({ minutes: 1 });
+
+  const next = computeNextRecurrence(anchor.toISO(), 'monthly', afterIST);
+
+  assert.ok(next, 'exactly MAX_CATCHUP_ITERATIONS steps must still resolve');
+  assert.strictEqual(next.toISO(), anchor.plus({ months: MAX_CATCHUP_ITERATIONS }).toISO());
+});
+
+// --- bulkAdvance ---------------------------------------------------------------
+
+test('bulkAdvance leaves patterns without a fixed calendar period alone', () => {
+  // Monthly and yearly are deliberately absent from BULK_ADVANCE_UNIT, and an
+  // unknown pattern must not be jumped either.
+  const anchor = at(27, 8);
+  const afterIST = anchor.plus({ days: 500 });
+
+  for (const type of ['monthly', 'yearly', 'fortnightly', undefined]) {
+    assert.strictEqual(
+      bulkAdvance(anchor, afterIST, type).toISO(),
+      anchor.toISO(),
+      `${type} must be left to the step loop`
+    );
+  }
+});
+
+test('bulkAdvance does not move when less than two whole periods remain', () => {
+  // The last period is always left to the caller's step loop, so a gap of one
+  // period (or less) has nothing to skip.
+  const anchor = at(27, 8);
+
+  assert.strictEqual(bulkAdvance(anchor, anchor, 'daily').toISO(), anchor.toISO());
+  assert.strictEqual(bulkAdvance(anchor, anchor.plus({ days: 1 }), 'daily').toISO(), anchor.toISO());
+  assert.strictEqual(
+    bulkAdvance(anchor, anchor.plus({ days: 1, hours: 12 }), 'daily').toISO(),
+    anchor.toISO(),
+    'a partial second period must not be skipped'
+  );
+});
+
+test('bulkAdvance never jumps past the floor it was given', () => {
+  // The contract the step loop relies on: the jump lands at or before afterIST,
+  // so no occurrence between the jump and the floor can be skipped silently.
+  const anchor = at(27, 9, 15);
+  for (const [type, gap] of [
+    ['hourly', { days: 45 }],
+    ['daily', { days: 500 }],
+    ['weekly', { weeks: 30 }],
+    ['weekday', { days: 90 }]
+  ]) {
+    const afterIST = anchor.plus(gap);
+    const jumped = bulkAdvance(anchor, afterIST, type);
+
+    assert.ok(jumped.isValid, `${type} jump must stay valid`);
+    assert.ok(jumped <= afterIST, `${type} jump overshot the floor`);
+    assert.ok(jumped >= anchor, `${type} jump must never go backwards`);
+  }
+});
+
+test('monthly catch-up stays on the single-stepped series', () => {
+  // Jan 31 stepped three times clamps to Apr 28; one plus({ months: 3 }) gives
+  // Apr 30. That disagreement is why monthly stays out of BULK_ADVANCE_UNIT.
+  //
+  // This pins catch-up to the SAME series the live rollover produces; it is not a
+  // claim that Apr 28 is the right answer. Single-stepping clamps at every short
+  // month and the day-of-month ratchets permanently downward, so "monthly on the
+  // 31st" decays to the 28th and stays there. That drift predates this change,
+  // and fixing it means storing the intended day-of-month and clamping per
+  // occurrence, which is a schedule-semantics decision, not a catch-up one.
+  const jan31 = DateTime.fromObject({ year: 2026, month: 1, day: 31, hour: 8 }, { zone: IST });
+
+  let stepped = jan31;
+  for (let i = 0; i < 3; i += 1) {
+    stepped = getNextRecurrenceDateTime(stepped, 'monthly');
+  }
+  assert.strictEqual(stepped.day, 28, 'stepping clamps at the short month (known drift)');
+  assert.notStrictEqual(jan31.plus({ months: 3 }).toISO(), stepped.toISO());
+
+  const next = computeNextRecurrence(jan31.toISO(), 'monthly', jan31.plus({ months: 2 }).plus({ minutes: 1 }));
+  assert.strictEqual(next.toISO(), stepped.toISO(), 'catch-up must match the stepped series');
+});
+
+// --- iteration guard -----------------------------------------------------------
+
+test('the iteration guard still returns null beyond MAX_CATCHUP_ITERATIONS steps', () => {
+  // Monthly is stepped one period at a time, so a gap of 500 months needs more
+  // steps than the guard allows and must bail out rather than loop.
+  const anchor = at(27, 8);
+  const afterIST = anchor.plus({ months: MAX_CATCHUP_ITERATIONS + 100 });
+
+  assert.strictEqual(computeNextRecurrence(anchor.toISO(), 'monthly', afterIST), null);
+});
+
+test('a missing or invalid floor yields null instead of looping', () => {
+  const anchor = at(27, 8).toISO();
+
+  assert.strictEqual(computeNextRecurrence(anchor, 'daily', null), null);
+  assert.strictEqual(computeNextRecurrence(anchor, 'daily', undefined), null);
+  assert.strictEqual(computeNextRecurrence(anchor, 'daily', DateTime.invalid('broken')), null);
+});
+
+test('weekday catch-up from a weekend anchor lands on a weekday', () => {
+  // A legacy record has no anchor, so catch-up falls back to remindAt, which a
+  // snooze can have parked on a Saturday. The bulk jump preserves that Saturday,
+  // so the step loop has to be the thing that clears the weekend.
+  const saturday = at(25, 8);
+  assert.strictEqual(saturday.weekday, 6, 'Jul 25 2026 must be a Saturday');
+
+  const next = computeNextRecurrence(saturday.toISO(), 'weekday', saturday.plus({ days: 120 }));
+
+  assert.ok(next, 'a weekday series must survive a long outage');
+  assert.ok(next.weekday <= 5, 'catch-up must not land on a weekend');
+  assert.strictEqual(next.hour, 8, 'hour slot must not drift');
+  assert.ok(next > saturday.plus({ days: 120 }), 'must land strictly after the floor');
 });
