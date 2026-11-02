@@ -9,7 +9,10 @@ const {
   backfillStorageMessageId,
   applyRecurrenceRollover,
   applySnooze,
-  applyStartupCatchUp
+  applyStartupCatchUp,
+  REMINDER_ACTION_OUTCOME,
+  resolveReminderForActor,
+  describeReminderActionFailure
 } = require('./reminderStorage');
 
 const ZONE = 'Asia/Kolkata';
@@ -346,4 +349,261 @@ test('startup deletes a recurring record whose pattern is unsatisfiable', async 
 
   assert.strictEqual(res.action, 'deleted');
   assert.strictEqual(msg.deleted, true);
+});
+
+// --- button actions on reminders that may be gone -----------------------------
+
+test('resolves a reminder for its own owner', async () => {
+  const msg = fakeMessage('m1', record({ storageMessageId: 'm1' }));
+  const ch = fakeChannel([], { byId: { m1: msg } });
+
+  const res = await resolveReminderForActor(ch, 'r1', 'u1', { storageMessageId: 'm1' });
+
+  assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.FOUND);
+  assert.strictEqual(res.stored.message.id, 'm1');
+});
+
+test('a record owned by someone else is forbidden, not missing', async () => {
+  const msg = fakeMessage('m1', record({ userId: 'owner', storageMessageId: 'm1' }));
+  const ch = fakeChannel([[msg]], { byId: { m1: msg } });
+
+  const res = await resolveReminderForActor(ch, 'r1', 'stranger', { storageMessageId: 'm1' });
+
+  assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.FORBIDDEN);
+  assert.strictEqual(res.stored, undefined);
+});
+
+test('a non-owner is handed nothing it could mutate', async () => {
+  // Buttons on a public reminder are visible to the whole channel, so the
+  // guarantee has to be server side: a non-owner never receives the storage
+  // message, so no handler path can edit or delete the record.
+  //
+  // This holds only while the storage channel is bot-write-only. Records are
+  // plain JSON messages and reminder ids are echoed publicly by /rme, so anyone
+  // able to post there could forge a record carrying someone else's reminder id
+  // and their own userId. Authorization rests on the record's self-reported
+  // userId, which is only as trustworthy as write access to that channel.
+  const msg = fakeMessage('m1', daily({ userId: 'owner', storageMessageId: 'm1' }));
+  const ch = fakeChannel([[msg]], { byId: { m1: msg } });
+
+  for (const stranger of ['stranger', 'another', '']) {
+    const res = await resolveReminderForActor(ch, 'r1', stranger, { maxPages: Infinity });
+    assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.FORBIDDEN, `actor ${JSON.stringify(stranger)}`);
+    assert.strictEqual(res.stored, undefined, 'no handle on the record');
+  }
+
+  assert.deepStrictEqual(msg.edits, [], 'record must never be edited by a non-owner');
+  assert.strictEqual(msg.deleted, false, 'record must never be deleted by a non-owner');
+
+  // The reply must also leave the public message alone, buttons included.
+  const reply = describeReminderActionFailure(REMINDER_ACTION_OUTCOME.FORBIDDEN, 'cancel');
+  assert.strictEqual(reply.retireButtons, false, "a stranger's press must not strip the owner's buttons");
+});
+
+test('a deleted record is missing, not forbidden', async () => {
+  const ch = fakeChannel([[]]);
+
+  const res = await resolveReminderForActor(ch, 'r1', 'u1', { maxPages: Infinity });
+
+  assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.MISSING);
+});
+
+test('a second cancel from an earlier occurrence reports the reminder as finished', async () => {
+  // A recurring reminder posts a new message with its own buttons every time it
+  // fires, and all of them point at one storage record. Cancelling from the
+  // newest message deletes that record; the older messages stay clickable.
+  const stored = fakeMessage('m1', daily({ storageMessageId: 'm1' }));
+  const live = fakeChannel([[stored]], { byId: { m1: stored } });
+
+  const first = await resolveReminderForActor(live, 'r1', 'u1', { maxPages: Infinity });
+  assert.strictEqual(first.outcome, REMINDER_ACTION_OUTCOME.FOUND);
+  await first.stored.message.delete();
+
+  // Same reminder id, pressed on an older occurrence, after the record is gone.
+  const emptied = fakeChannel([[]]);
+  const second = await resolveReminderForActor(emptied, 'r1', 'u1', { maxPages: Infinity });
+
+  assert.strictEqual(second.outcome, REMINDER_ACTION_OUTCOME.MISSING);
+
+  const reply = describeReminderActionFailure(second.outcome, 'cancel');
+  assert.strictEqual(reply.retireButtons, true, 'dead buttons should be retired');
+  assert.ok(
+    !/authorized|authorised/i.test(reply.content),
+    'the owner must not be told they lack permission for their own reminder'
+  );
+  assert.match(reply.content, /no longer active/);
+});
+
+test('an ownership failure keeps the buttons and says who may act', () => {
+  const reply = describeReminderActionFailure(REMINDER_ACTION_OUTCOME.FORBIDDEN, 'snooze');
+
+  assert.strictEqual(reply.retireButtons, false, 'the owner can still use them');
+  assert.match(reply.content, /Only the person who created this reminder can snooze it\./);
+});
+
+test('startup keeps an hourly recurring record after a long outage', async () => {
+  // The series must survive the outage: before bulk catch-up, 1440 hourly steps
+  // exhausted the iteration guard and this record was deleted outright, leaving
+  // every already-posted reminder message with buttons pointing at nothing.
+  const anchor = at(27, 8).minus({ days: 60 });
+  const data = record({
+    remindAt: anchor.toISO(),
+    recurrence: { type: 'hourly', anchor: anchor.toISO() }
+  });
+  const msg = fakeMessage('m1', data);
+
+  const res = await applyStartupCatchUp(msg, data, at(27, 8));
+
+  assert.strictEqual(res.action, 'rescheduled');
+  assert.strictEqual(msg.deleted, false, 'a long outage must not destroy the series');
+  assert.strictEqual(msg.persisted.remindAt, at(27, 9).toISO());
+  assert.strictEqual(msg.persisted.recurrence.anchor, at(27, 9).toISO());
+});
+
+test('a legacy record with no storageMessageId still resolves for its owner', async () => {
+  // resolveReminderForActor looks up without the owner filter, so the scan path
+  // has to match on reminder id alone and let the ownership check run afterwards.
+  const msg = fakeMessage('m1', record());
+  const ch = fakeChannel([[msg]]);
+
+  const res = await resolveReminderForActor(ch, 'r1', 'u1', { maxPages: Infinity });
+
+  assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.FOUND);
+  assert.strictEqual(res.stored.message.id, 'm1');
+});
+
+test('resolveReminderForActor honours an explicit page cap', async () => {
+  // The wrapper must pass its options through: with the fallback disabled the
+  // record on page 1 is never reached, so the press reports the reminder gone.
+  const msg = fakeMessage('m1', record());
+  const ch = fakeChannel([[msg]]);
+
+  const res = await resolveReminderForActor(ch, 'r1', 'u1', { maxPages: 0 });
+
+  assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.MISSING);
+  assert.deepStrictEqual(ch.fetchCalls, [], 'a disabled fallback must not fetch');
+});
+
+test('an unidentified actor is denied rather than granted owner rights', async () => {
+  // This is the only authorization check left on the snooze and cancel paths, so
+  // it fails closed. Every caller in index.js passes interaction.user.id, which
+  // is always a snowflake string, but a future call-site that omits the actor
+  // must be denied instead of quietly receiving a mutable handle on the record.
+  const msg = fakeMessage('m1', record({ userId: 'owner', storageMessageId: 'm1' }));
+  const ch = fakeChannel([[msg]], { byId: { m1: msg } });
+
+  for (const actor of [undefined, '', null, 0, 12345]) {
+    const res = await resolveReminderForActor(ch, 'r1', actor, { storageMessageId: 'm1' });
+
+    assert.strictEqual(
+      res.outcome,
+      REMINDER_ACTION_OUTCOME.FORBIDDEN,
+      `actor ${JSON.stringify(actor)} must not pass as the owner`
+    );
+    assert.strictEqual(res.stored, undefined, 'no handle for an unidentified actor');
+  }
+
+  assert.deepStrictEqual(msg.edits, [], 'record must never be edited');
+  assert.strictEqual(msg.deleted, false, 'record must never be deleted');
+});
+
+test('a colliding reminder id does not lock the owner out', async () => {
+  // Ids are Date.now() strings, so two users who create a reminder in the same
+  // millisecond share one. The scan must walk past somebody else's record to
+  // reach the actor's own rather than settling for the first id match.
+  const theirs = fakeMessage('mA', record({ userId: 'userA' }));
+  const ours = fakeMessage('mB', record({ userId: 'userB' }));
+  const ch = fakeChannel([[theirs, ours]]);
+
+  const res = await resolveReminderForActor(ch, 'r1', 'userB', { maxPages: Infinity });
+
+  assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.FOUND);
+  assert.strictEqual(res.stored.message.id, 'mB', 'must resolve the actor own record');
+});
+
+test('a colliding id owned only by someone else is still forbidden', async () => {
+  const theirs = fakeMessage('mA', record({ userId: 'userA' }));
+  const ch = fakeChannel([[theirs]]);
+
+  const res = await resolveReminderForActor(ch, 'r1', 'userB', { maxPages: Infinity });
+
+  assert.strictEqual(res.outcome, REMINDER_ACTION_OUTCOME.FORBIDDEN);
+  assert.strictEqual(res.stored, undefined);
+});
+
+test('only a missing record retires the buttons', async () => {
+  // An unrecognised outcome is a programming error, and the destructive reading
+  // is the dangerous default: it would strip the buttons off a live reminder and
+  // tell the owner it had finished. Anything that is not MISSING leaves the
+  // public message alone, and nothing but FORBIDDEN mentions permissions.
+  for (const outcome of ['weird', undefined, null, 'storage_unavailable']) {
+    const reply = describeReminderActionFailure(outcome, 'cancel');
+
+    assert.strictEqual(reply.retireButtons, false, `outcome ${String(outcome)} must not strip buttons`);
+    assert.ok(!/Only the person/.test(reply.content), 'must not imply a permission problem');
+    assert.ok(!/no longer active/.test(reply.content), 'must not claim the reminder is finished');
+  }
+
+  const missing = describeReminderActionFailure(REMINDER_ACTION_OUTCOME.MISSING, 'cancel');
+  assert.match(missing.content, /no longer active/);
+  assert.strictEqual(missing.retireButtons, true);
+
+  const forbidden = describeReminderActionFailure(REMINDER_ACTION_OUTCOME.FORBIDDEN, 'cancel');
+  assert.match(forbidden.content, /Only the person who created this reminder/);
+  assert.strictEqual(forbidden.retireButtons, false);
+});
+
+test('startup keeps a daily series after an outage longer than the step guard', async () => {
+  // 500 daily steps exceed MAX_CATCHUP_ITERATIONS. Before bulk catch-up this
+  // record resolved to null and the startup scan deleted it outright.
+  const anchor = at(27, 8).minus({ days: 500 });
+  const data = record({
+    remindAt: anchor.toISO(),
+    recurrence: { type: 'daily', anchor: anchor.toISO() }
+  });
+  const msg = fakeMessage('m1', data);
+
+  const res = await applyStartupCatchUp(msg, data, at(27, 8));
+
+  assert.strictEqual(res.action, 'rescheduled');
+  assert.strictEqual(msg.deleted, false, 'a long outage must not destroy the series');
+  assert.strictEqual(msg.persisted.remindAt, at(28, 8).toISO());
+  assert.strictEqual(msg.persisted.recurrence.anchor, at(28, 8).toISO());
+});
+
+test('startup catch-up on a weekday series lands on a weekday', async () => {
+  const anchor = at(27, 8).minus({ days: 120 });
+  const data = record({
+    remindAt: anchor.toISO(),
+    recurrence: { type: 'weekday', anchor: anchor.toISO() }
+  });
+  const msg = fakeMessage('m1', data);
+
+  const res = await applyStartupCatchUp(msg, data, at(27, 8));
+
+  assert.strictEqual(res.action, 'rescheduled');
+  assert.strictEqual(msg.deleted, false);
+  const next = DateTime.fromISO(msg.persisted.remindAt).setZone(ZONE);
+  assert.ok(next.weekday <= 5, 'must not resume on a weekend');
+  assert.strictEqual(next.hour, 8, 'hour slot must not drift');
+  assert.strictEqual(next.toISO(), at(28, 8).toISO());
+});
+
+test('a late-firing hourly occurrence reschedules instead of being marked triggered', async () => {
+  // The other way a long gap reaches catch-up: the process was wedged, so the
+  // job fires 30 days late. Exhausting the guard here marked the record
+  // triggered, which quietly ended the series without deleting it.
+  const fired = at(27, 8).minus({ days: 30 });
+  const data = record({
+    remindAt: fired.toISO(),
+    recurrence: { type: 'hourly', anchor: fired.toISO() }
+  });
+  const msg = fakeMessage('m1', data);
+
+  const res = await applyRecurrenceRollover({ message: msg, data }, fired.toISO(), at(27, 8));
+
+  assert.strictEqual(res.rescheduled, true, 'the series must survive the delay');
+  assert.strictEqual(msg.persisted.triggered, false);
+  assert.strictEqual(msg.persisted.remindAt, at(27, 9).toISO());
+  assert.strictEqual(msg.persisted.recurrence.anchor, at(27, 9).toISO());
 });
