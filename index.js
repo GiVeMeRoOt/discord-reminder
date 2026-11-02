@@ -18,8 +18,11 @@ const {
   backfillStorageMessageId,
   applyRecurrenceRollover,
   applySnooze,
-  applyStartupCatchUp
+  applyStartupCatchUp,
+  REMINDER_ACTION_OUTCOME,
+  resolveReminderForActor
 } = require('./reminderStorage');
+const { replyToUnavailableReminder } = require('./interactionReplies');
 require('dotenv').config();
 
 // Global map to store scheduled jobs (key: reminder id, value: job object)
@@ -379,14 +382,15 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferUpdate();
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (!storageChannel || !storageChannel.isTextBased()) {
-          await interaction.editReply({ content: 'Storage channel not available.', components: [] });
+          await interaction.followUp({ content: 'Storage channel not available.', ephemeral: true });
           return;
         }
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
-        if (!storedReminder) {
-          await interaction.editReply({ content: 'This reminder no longer exists or you are not authorized to snooze it.', components: [] });
+        const resolution = await resolveReminderForActor(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
+        if (resolution.outcome !== REMINDER_ACTION_OUTCOME.FOUND) {
+          await replyToUnavailableReminder(interaction, resolution.outcome, 'snooze');
           return;
         }
+        const storedReminder = resolution.stored;
         const newDate = new Date(Date.now() + snoozeTimeMs);
         // Moves only this occurrence: the recurrence anchor is deliberately left
         // untouched so the series keeps its canonical slot afterwards.
@@ -398,8 +402,10 @@ client.on('interactionCreate', async interaction => {
       } catch (err) {
         console.error('Error handling snooze button:', err);
         try {
+          // Answered privately rather than with editReply: the deferred reply is
+          // the public reminder message, and an error must not replace its text.
           if (interaction.deferred || interaction.replied) {
-            await interaction.editReply({ content: 'An error occurred while snoozing your reminder. Please try again later.', components: [] });
+            await interaction.followUp({ content: 'An error occurred while snoozing your reminder. Please try again later.', ephemeral: true });
           } else {
             await interaction.reply({ content: 'An error occurred while snoozing your reminder. Please try again later.', ephemeral: true });
           }
@@ -413,25 +419,41 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferUpdate();
         const storageChannel = await client.channels.fetch(STORAGE_CHANNEL_ID);
         if (!storageChannel || !storageChannel.isTextBased()) {
-          await interaction.editReply({ content: 'Storage channel not available.', components: [] });
+          await interaction.followUp({ content: 'Storage channel not available.', ephemeral: true });
           return;
         }
 
-        const storedReminder = await fetchStoredReminderMessage(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
-        if (!storedReminder) {
-          await interaction.editReply({ content: 'This reminder no longer exists or you are not authorized to cancel it.', components: [] });
+        const resolution = await resolveReminderForActor(storageChannel, reminderId, interaction.user.id, { maxPages: Infinity });
+        if (resolution.outcome !== REMINDER_ACTION_OUTCOME.FOUND) {
+          await replyToUnavailableReminder(interaction, resolution.outcome, 'cancel');
           return;
         }
+        const storedReminder = resolution.stored;
 
         cancelScheduledJob(reminderId);
-        await storedReminder.message.delete();
+        try {
+          await storedReminder.message.delete();
+        } catch (err) {
+          // 10008 Unknown Message means something else already deleted the
+          // record -- a double press, or another of this series' button-bearing
+          // messages. The reminder is cancelled either way, so report success
+          // rather than telling the user their successful cancel failed.
+          if (err?.code !== 10008) {
+            throw err;
+          }
+        }
+        // Run again after the delete: the lookup above can take a while, and an
+        // occurrence that fired during it would have rescheduled a fresh job.
+        cancelScheduledJob(reminderId);
 
         await interaction.editReply({ content: `<@${interaction.user.id}> Reminder cancelled.`, components: [] });
       } catch (err) {
         console.error('Error handling cancel button:', err);
         try {
+          // Answered privately rather than with editReply: the deferred reply is
+          // the public reminder message, and an error must not replace its text.
           if (interaction.deferred || interaction.replied) {
-            await interaction.editReply({ content: 'An error occurred while cancelling your reminder. Please try again later.', components: [] });
+            await interaction.followUp({ content: 'An error occurred while cancelling your reminder. Please try again later.', ephemeral: true });
           } else {
             await interaction.reply({ content: 'An error occurred while cancelling your reminder. Please try again later.', ephemeral: true });
           }
